@@ -6,7 +6,8 @@ from ts_model_training.ts_models.ts_grud import GRUD_TS
 from ts_model_training.ts_models.ts_interpnet import INTERPNET_TS
 from ts_model_training.ts_models.ts_strats import STRATS_TS
 from ts_model_training.ts_models.mlp import MLP
-
+from ts_model_training.ts_models.ts_mamba import MAMBA_TS
+from ts_model_training.ts_models.ts_mamba_fusion import MAMBA_FUSION_TS
 from ts_model_training.batcher import Batcher, BatcherA, BatcherB, BatcherC_sup, BatcherC_unsup
 
 MODEL_CLASSES = {
@@ -17,7 +18,9 @@ MODEL_CLASSES = {
     'grud': GRUD_TS,
     'interpnet': INTERPNET_TS,
     'strats': STRATS_TS,
-    'mlp': MLP
+    'mlp': MLP,
+    "mamba": MAMBA_TS,
+    "mamba_fusion": MAMBA_FUSION_TS,
 }
 
 def build_model(args):
@@ -33,7 +36,7 @@ def build_model(args):
 def build_batcher(args, input_dict):
     # get batcher based on model
     model_type = args.model_type
-    if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp']:
+    if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp', 'mamba', 'mamba_fusion']:
         batcher = BatcherA(args, input_dict)
     elif model_type in ['grud', 'interpnet']:
         batcher = BatcherB(args, input_dict)
