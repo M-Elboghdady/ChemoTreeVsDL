@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pickle
 from ts_model_training.utils import safe_pos_freq, remove_features_not_in_train, compute_lab_frequency, ids_in_data, set_splits, compute_class_weight
-from ts_model_training.preprocessor import PreprocessorA, PreprocessorB, PreprocessorC_sup, PreprocessorC_unsup
+from ts_model_training.preprocessor import PreprocessorA, PreprocessorB, PreprocessorC_sup, PreprocessorC_unsup, PreprocessorEHRMamba
 
 from config.constants import PROJECT_ROOT
 
@@ -139,6 +139,8 @@ class TimeSeriesDataset:
         train_ind = self.splits['train']
         if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp', 'mamba', 'mamba_fusion']:
             self.preproc = PreprocessorA(self)
+	elif model_type == 'ehrmamba_lab':
+    	    self.preproc = PreprocessorEHRMamba(self)
         elif model_type in ['grud', 'interpnet']:
             self.preproc = PreprocessorB(self)
         elif model_type in ['strats', 'istrats'] and self.args.train_mode == "pretrain":
@@ -152,7 +154,4 @@ class TimeSeriesDataset:
         # save input dict
         self.preproc.save_inputs()
         # remove problematic inputs
-        
-    
-
 

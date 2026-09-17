@@ -214,3 +214,23 @@ class BatcherC_sup(Batcher):
         }
 
 
+class BatcherEHRMamba(Batcher):
+    def __init__(self, args, input_dict):
+        super().__init__(args, input_dict)
+        self.event_ids = self.input_dict["event_ids"]
+        self.values = self.input_dict["values"]
+        self.event_mask = self.input_dict["event_mask"]
+        self.event_times = self.input_dict["event_times"]
+        self.lengths = self.input_dict["lengths"]
+
+    def get_batch(self, ind=None):
+        ind = self._get_indices(ind)
+        return {
+            "event_ids": torch.LongTensor(self.event_ids[ind]),
+            "values": torch.FloatTensor(self.values[ind]),
+            "event_mask": torch.FloatTensor(self.event_mask[ind]),
+            "event_times": torch.FloatTensor(self.event_times[ind]),
+            "lengths": torch.LongTensor(self.lengths[ind]),
+            "demo": torch.FloatTensor(self.demo[ind]),
+            "labels": torch.FloatTensor(self.y[ind]),
+        }

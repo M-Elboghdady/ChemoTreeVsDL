@@ -131,17 +131,17 @@ mamba:
 mamba_fusion:
   grid_search:
     variant: ["VMD"]
-    hid_dim: [64, 128]
-    num_layers: [1, 2]
-    dropout: [0.2, 0.3]
+    hid_dim: [128, 192]
+    num_layers: [1, 2, 4]
+    dropout: [0.2]
     d_state: [16]
     d_conv: [4]
     expand: [2]
-    d_a: [32]
-    lr: [1e-4, 5e-4]
+    d_a: [32, 64]
+    lr: [5e-4, 8e-4]
     agg: ["mean"]
     impute: ["fill"]
-    pos_class_weight: [0, 1]
+    pos_class_weight: [1]
   mimic_cohort_NF_30_days:
     variant: "VMD"
     hid_dim: 64
@@ -154,4 +154,26 @@ mamba_fusion:
     lr: 1e-4
     agg: "mean"
     impute: "fill"
+    pos_class_weight: 1
+
+ehrmamba_lab:
+  grid_search:
+    hid_dim: [64, 128]
+    num_layers: [2, 4, 8, 16]
+    dropout: [0.2, 0.3]
+    d_state: [16]
+    d_conv: [4]
+    expand: [2]
+    lr: [1e-4, 5e-4, 8e-4, 1e-5]
+    max_seq_len: [512]
+    pos_class_weight: [1]
+  mimic_cohort_NF_30_days:
+    hid_dim: 64
+    num_layers: 1
+    dropout: 0.2
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    lr: 1e-4
+    max_seq_len: 512
     pos_class_weight: 1

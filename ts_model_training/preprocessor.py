@@ -328,3 +328,255 @@ class PreprocessorC_sup(PreprocessorC): # supervised
         self.args.logger.write('Input prepared')
 
 
+class PreprocessorEHRMamba(Preprocessor):
+    """Event-level lab sequences for ehrmamba_lab (no V/M/D discretization)."""
+
+    PAD_ID = 0
+    CLS_ID = 1
+    REG_ID = 2
+    UNK_ID = 3
+    LAB_ID_OFFSET = 4
+
+    def prepare_inputs(self):
+        args = self.args
+        logger = args.logger
+
+        # Exact minute timestamps required for continuous Time2Vec event_times
+        if getattr(args, "drop_minutes", False):
+            raise ValueError(
+                "ehrmamba_lab requires drop_minutes=False "
+                "(do not pass --drop_minutes)."
+            )
+
+        max_seq_len = int(getattr(args, "max_seq_len", 512))
+        if max_seq_len < 3:
+            raise ValueError(f"max_seq_len must be >= 3, got {max_seq_len}")
+
+        days = int(getattr(args, "days_before_discharge", 14))
+        max_minutes = (days + 1) * 24 * 60
+
+        self.variables = sorted(self.data.itemid.astype(str).unique())
+        self.var_to_ind = {v: i + self.LAB_ID_OFFSET for i, v in enumerate(self.variables)}
+
+        vocab_size = self.LAB_ID_OFFSET + len(self.variables)
+        args.vocab_size = vocab_size
+        args.V = len(self.variables)
+
+        logger.write(
+            f"\nEHRMamba-Lab vocab_size={vocab_size} "
+            f"(#labs={len(self.variables)}) days={days} "
+            f"max_minutes={max_minutes}"
+        )
+
+        data = self.data.copy()
+
+        if "hadm_id" not in data.columns:
+            raise ValueError("EHRMamba-Lab requires hadm_id in the event table")
+
+        data["itemid"] = data["itemid"].astype(str)
+
+        data = (
+            data.groupby(
+                ["hadm_id", "ts_ind", "minute", "itemid"],
+                as_index=False
+            )["value"]
+            .mean()
+        )
+
+        data["event_id"] = (
+            data["itemid"]
+            .map(self.var_to_ind)
+            .fillna(self.UNK_ID)
+            .astype(int)
+        )
+
+        if data.empty:
+            raise ValueError("No temporal lab events remain after filtering.")
+
+        logger.write(
+            f"  minute range: min={int(data['minute'].min())} "
+            f"max={int(data['minute'].max())} "
+            f"valid_range=[0, {max_minutes - 1}]"
+        )
+
+        if (data["minute"] < 0).any():
+            raise ValueError("Found negative event times (minute < 0).")
+
+        if (data["minute"] >= max_minutes).any():
+            raise ValueError(
+                f"Found events outside valid temporal range "
+                f"(minute >= {max_minutes})."
+            )
+
+        if not np.isfinite(data["value"].to_numpy(dtype=float)).all():
+            raise ValueError("Found non-finite raw lab values")
+
+        train_rows = data[data["ts_ind"].isin(self.train_ind)]
+
+        if train_rows.empty:
+            raise ValueError("No training lab events available for normalization.")
+
+        stats = (
+            train_rows.groupby("itemid")["value"]
+            .agg(["mean", "std"])
+            .reindex(self.variables)
+        )
+
+        means = stats["mean"].fillna(0.0).to_dict()
+        stds_raw = stats["std"].replace(0, np.nan).fillna(1.0).to_dict()
+        stds = {k: (v if v > 1e-6 else 1.0) for k, v in stds_raw.items()}
+
+        def norm_value(itemid, val):
+            return (val - means.get(itemid, 0.0)) / stds.get(itemid, 1.0)
+
+        data["value_norm"] = [
+            norm_value(i, v)
+            for i, v in zip(data["itemid"], data["value"])
+        ]
+
+        if not np.isfinite(data["value_norm"].to_numpy(dtype=float)).all():
+            raise ValueError("Found non-finite normalized lab values")
+
+        data["event_time"] = data["minute"].astype(np.float32) / 60.0
+
+        if not np.isfinite(data["event_time"].to_numpy(dtype=float)).all():
+            raise ValueError("Found non-finite continuous event times")
+
+        N = int(args.N)
+
+        if (data["ts_ind"] < 0).any() or (data["ts_ind"] >= N).any():
+            raise ValueError(f"ts_ind out of range [0, {N})")
+
+        event_ids = np.zeros((N, max_seq_len), dtype=np.int64)
+        values = np.zeros((N, max_seq_len), dtype=np.float32)
+        event_mask = np.zeros((N, max_seq_len), dtype=np.float32)
+        event_times = np.zeros((N, max_seq_len), dtype=np.float32)
+        lengths = np.zeros(N, dtype=np.int64)
+
+        counts = np.zeros(N, dtype=np.int64)
+        removed = np.zeros(N, dtype=np.int64)
+        n_trunc = 0
+
+        grouped = (
+            data.sort_values(
+                ["ts_ind", "minute", "itemid"],
+                kind="stable"
+            )
+            .groupby("ts_ind", sort=False)
+        )
+
+        for ts_ind, g in grouped:
+            ts_ind = int(ts_ind)
+
+            ev = g[
+                ["event_id", "value_norm", "event_time"]
+            ].to_numpy()
+
+            n_events = len(ev)
+            counts[ts_ind] = n_events
+            capacity = max_seq_len - 2
+
+            if n_events > capacity:
+                n_trunc += 1
+                removed[ts_ind] = n_events - capacity
+                ev = ev[-capacity:]
+
+            seq_event = [self.CLS_ID] + ev[:, 0].astype(int).tolist() + [self.REG_ID]
+            seq_val = [0.0] + ev[:, 1].astype(float).tolist() + [0.0]
+            seq_time = [0.0] + ev[:, 2].astype(float).tolist() + [0.0]
+            seq_event_mask = [0.0] + [1.0] * len(ev) + [0.0]
+
+            L = len(seq_event)
+
+            lengths[ts_ind] = L
+            event_ids[ts_ind, :L] = seq_event
+            values[ts_ind, :L] = seq_val
+            event_times[ts_ind, :L] = seq_time
+            event_mask[ts_ind, :L] = seq_event_mask
+
+        for ts_ind in np.where(lengths == 0)[0]:
+            event_ids[ts_ind, 0] = self.CLS_ID
+            event_ids[ts_ind, 1] = self.REG_ID
+            lengths[ts_ind] = 2
+
+        if lengths.min() < 2 or lengths.max() > max_seq_len:
+            raise ValueError(
+                f"Invalid lengths: min={lengths.min()} "
+                f"max={lengths.max()} "
+                f"max_seq_len={max_seq_len}"
+            )
+
+        reg_ok = np.all(
+            event_ids[np.arange(N), lengths - 1] == self.REG_ID
+        )
+
+        if not reg_ok:
+            raise ValueError("Some sequences do not end with REG at lengths-1")
+
+        def pct(p):
+            return float(np.percentile(counts, p))
+
+        frac_trunc = n_trunc / float(N)
+
+        mean_removed_truncated = (
+            float(removed[removed > 0].mean())
+            if np.any(removed > 0)
+            else 0.0
+        )
+
+        logger.write(
+            "\nEHRMamba-Lab event counts per admission "
+            "(labs only, excluding CLS/REG):"
+        )
+
+        logger.write(
+            f"  N={N} min={counts.min()} "
+            f"median={np.median(counts):.0f} "
+            f"p75={pct(75):.0f} "
+            f"p90={pct(90):.0f} "
+            f"p95={pct(95):.0f} "
+            f"p99={pct(99):.0f} "
+            f"max={counts.max()}"
+        )
+
+        logger.write(
+            f"  provisional max_seq_len={max_seq_len}"
+        )
+
+        logger.write(
+            f"  truncated={n_trunc} "
+            f"({100 * frac_trunc:.2f}% of N) "
+            f"mean_removed_all={removed.mean():.2f} "
+            f"mean_removed_truncated={mean_removed_truncated:.2f} "
+            f"max_removed={int(removed.max())}"
+        )
+
+        if frac_trunc >= 0.05:
+            logger.write(
+                "  WARNING: truncation >= 5%; "
+                "revise max_seq_len before full HPO"
+            )
+
+        self.input_dict = {
+            "event_ids": event_ids,
+            "values": values,
+            "event_mask": event_mask,
+            "event_times": event_times,
+            "lengths": lengths,
+            "lab_means": means,
+            "lab_stds": stds,
+            "vocab_size": vocab_size,
+            "max_seq_len": max_seq_len,
+        }
+
+        logger.write(
+            f"  tensors: event_ids{event_ids.shape} "
+            f"values{values.shape} "
+            f"event_mask{event_mask.shape} "
+            f"event_times{event_times.shape} "
+            f"lengths{lengths.shape}"
+        )
+
+        logger.write(
+            "EHRMamba-Lab event sequences prepared (no V/M/D)."
+        )
