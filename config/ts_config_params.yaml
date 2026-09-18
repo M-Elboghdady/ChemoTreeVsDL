@@ -167,6 +167,8 @@ ehrmamba_lab:
     lr: [1e-4, 5e-4, 8e-4, 1e-5]
     max_seq_len: [512]
     pos_class_weight: [1]
+    value_encoding: ["continuous"]
+#    value_encoding: ["bins5"]
   mimic_cohort_NF_30_days:
     hid_dim: 64
     num_layers: 1
@@ -177,3 +179,4 @@ ehrmamba_lab:
     lr: 1e-4
     max_seq_len: 512
     pos_class_weight: 1
+    value_encoding: continuous

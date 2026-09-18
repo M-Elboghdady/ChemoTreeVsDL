@@ -139,8 +139,8 @@ class TimeSeriesDataset:
         train_ind = self.splits['train']
         if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp', 'mamba', 'mamba_fusion']:
             self.preproc = PreprocessorA(self)
-	    elif model_type == 'ehrmamba_lab':
-    	    self.preproc = PreprocessorEHRMamba(self)
+        elif model_type == 'ehrmamba_lab':
+            self.preproc = PreprocessorEHRMamba(self)
         elif model_type in ['grud', 'interpnet']:
             self.preproc = PreprocessorB(self)
         elif model_type in ['strats', 'istrats'] and self.args.train_mode == "pretrain":

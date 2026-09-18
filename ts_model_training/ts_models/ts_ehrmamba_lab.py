@@ -28,11 +28,18 @@ class Time2Vec(nn.Module):
 
 
 class EHRLabEmbedding(nn.Module):
-    def __init__(self, vocab_size, d_model, dropout):
+    def __init__(self, vocab_size, d_model, dropout, value_encoding):
         super().__init__()
+        self.value_encoding = value_encoding
 
         self.concept_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
-        self.value_proj = nn.Linear(1, d_model)
+        if value_encoding == "continuous":
+            self.value_encoder = nn.Linear(1, d_model)
+        elif value_encoding == "bins5":
+            self.value_encoder = nn.Embedding(5, d_model)
+        else:
+            raise ValueError(f"Unknown value_encoding: {value_encoding}")
+
         self.time_emb = Time2Vec(d_model)
         self.fusion_proj = nn.Linear(3 * d_model, d_model)
         self.embedding_norm = nn.LayerNorm(d_model)
@@ -42,7 +49,10 @@ class EHRLabEmbedding(nn.Module):
         concept = self.concept_emb(event_ids)
         measurement_mask = event_mask.bool().unsqueeze(-1)
 
-        value = self.value_proj(values.unsqueeze(-1))
+        if self.value_encoding == "continuous":
+            value = self.value_encoder(values.unsqueeze(-1).float())
+        else:
+            value = self.value_encoder(values.long())
         value = value.masked_fill(~measurement_mask, 0.0)
 
         time = self.time_emb(event_times)
@@ -62,12 +72,12 @@ class EHRLabEmbedding(nn.Module):
 class EHRMAMBA_LAB_TS(TimeSeriesModel):
     def __init__(self, args):
         super().__init__(args)
-
+        value_encoding = str(getattr(args, "value_encoding", "continuous"))
         H = int(args.hid_dim)
         dropout = float(args.dropout)
         vocab_size = int(args.vocab_size)
 
-        self.embedding = EHRLabEmbedding(vocab_size=vocab_size, d_model=H, dropout=dropout)
+        self.embedding = EHRLabEmbedding(vocab_size=vocab_size, d_model=H, dropout=dropout,value_encoding=value_encoding)
 
         self.layers = nn.ModuleList([
             _MambaResidualBlock(

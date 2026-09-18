@@ -11,7 +11,7 @@ class Preprocessor:
         self.data = dataset.data
         self.train_ind = self.dataset.splits["train"]
 
-    def set_variables(self):          
+    def set_variables(self):
         self.variables = self.get_vars()
         self.var_to_ind = {v: i for i, v in enumerate(self.variables)}
         # remove vars not in pretrain
@@ -34,24 +34,24 @@ class Preprocessor:
 
     def prepare_inputs(self):
         raise NotImplementedError
-    
+
     def save_inputs(self):
         # merge current input_dict with splits and ts_id_to_ind
         self.input_dict = {
             **self.input_dict,
             "demo_norm": self.dataset.demo,
             "demo_raw": self.dataset.demo_raw,
-            "demo_means" : self.dataset.demo_means, 
-            "demo_stds" : self.dataset.demo_stds,           
+            "demo_means" : self.dataset.demo_means,
+            "demo_stds" : self.dataset.demo_stds,
             "splits": self.dataset.splits,
             "ts_id_to_ind": self.dataset.ts_id_to_ind,
             "var_to_ind": self.var_to_ind
         } # if the task is supervised, save also the target
         if self.args.train_mode != "pretrain":
             self.input_dict["target"] = self.dataset.y
-            
+
         # pickle dump only if not training in nested crossvalidation
-        if not (self.args.cv_mode == "grid"): #self.args.grid == "nested" and 
+        if not (self.args.cv_mode == "grid"): #self.args.grid == "nested" and
             output_path = Path(self.dataset.args.paths["output_path"]) / "input_dict.pkl"
             with open(output_path, "wb") as f:
                 pickle.dump(self.input_dict, f)
@@ -86,7 +86,7 @@ class PreprocessorA(Preprocessor):
         self.trim()
         last, avgs, self.obs, self.delta, sums, counts = discrete_tensors(self.data, self.args.N, self.args.T, self.args.V)
 
-        ## AGGREGATION 
+        ## AGGREGATION
         if self.args.agg == "mean": # aggregation by average value
             self.values = avgs
         else: # default is aggregation by last recorded value
@@ -96,13 +96,13 @@ class PreprocessorA(Preprocessor):
         if self.args.impute == "fill":
             self.values = fill_impute(self.values, self.obs)
         else: # default is mean imputation
-            self.values = fill_mean(self.values, self.obs, self.train_ind)     
+            self.values = fill_mean(self.values, self.obs, self.train_ind)
         self.input_dict = {"values_raw" : self.values, "obs" : self.obs, "delta" : self.delta}
         # compute means and stds
         self.normalise()
         self.input_dict.update({"values_norm": self.values, "values_means": self.means, "values_stds": self.stds})
 
-        
+
         # VARIANTS (concatenate data)
         variant = self.args.variant
         if variant == "V":
@@ -135,9 +135,10 @@ class PreprocessorB(Preprocessor):
             timestamps = timestamps.groupby('hadm_id').head(self.args.max_timesteps)
             self.data = self.data.merge(timestamps, on=['hadm_id', 'minute'], how='inner')
             self.args.logger.write('\nData trimmed to max length')
-    
-    def compute_means_stds(self):  
+
+    def compute_means_stds(self):
         return compute_means_stds_df(self.data, self.train_ind)
+
 
     def normalise(self):
         means_stds = self.compute_means_stds()
@@ -147,14 +148,14 @@ class PreprocessorB(Preprocessor):
 
     def prepare_inputs(self):
         model_type = self.args.model_type
-        
+
         self.set_variables()
         self.trim()
         self.normalise()
 
         N = self.args.N
         V = self.args.V
-        
+
         if model_type == 'grud':
             deltas = [[] for _ in range(N)]
         elif model_type == 'interpnet':
@@ -191,7 +192,7 @@ class PreprocessorB(Preprocessor):
 
             values[ts_ind] = curr_values
             mask[ts_ind] = curr_mask
-            
+
         # save results to self
         self.values = values
         self.mask = mask
@@ -209,25 +210,25 @@ class PreprocessorB(Preprocessor):
 class PreprocessorC(Preprocessor): # strats
     # preprocessing params
     # args.max_obs (default 1000) - can be set to -1 for no trimming
-        
+
     def get_vars(self):
         raise NotImplementedError
 
     def compute_means_stds(self):
         raise NotImplementedError
-            
+
     def normalise(self):
         means_stds = self.compute_means_stds()
         self.data = self.data.merge(means_stds, on='itemid', how='left')
         self.data['value'] = (self.data['value'] - self.data['mean']) / self.data['std']
         self.args.logger.write('Data normalised')
-        
+
     def prepare_inputs(self):
         raise NotImplementedError
-    
-    
+
+
 class PreprocessorC_unsup(PreprocessorC): # unsupervised
-    
+
     def trim(self):
         # eliminate duplicate lab measurements
         self.data = self.data.groupby(["hadm_id", "ts_ind", "itemid","var_ind","minute"]).value.mean().reset_index()
@@ -238,7 +239,7 @@ class PreprocessorC_unsup(PreprocessorC): # unsupervised
         self.pt_variables = sorted(self.data.itemid.unique())
         return self.pt_variables
 
-    def compute_means_stds(self):     
+    def compute_means_stds(self):
         self.pt_means_stds = compute_means_stds_df(self.data, self.train_ind)
         return self.pt_means_stds
 
@@ -264,20 +265,20 @@ class PreprocessorC_unsup(PreprocessorC): # unsupervised
             times[row.ts_ind].append(row.minute)
             varis[row.ts_ind].append(row.var_ind)
         self.values, self.times, self.varis = values, times, varis
-        
+
         # unique sorted timestamps except the last one for each patient
         self.timestamps = [np.array(sorted(list(set(x)))[:-1]) for x in self.times]
         # only keep timepoints that occur 12h or later
-        self.timestamps = [x[x>=720] for x in self.timestamps] 
+        self.timestamps = [x[x>=720] for x in self.timestamps]
         self.input_dict = {"values" : self.values, "times" : self.times, "varis": self.varis, "timestamps": self.timestamps}
         self.args.logger.write('Input prepared.')
-        
+
         # get all admissions where there are no valid timestamps left after filtering
         delete = [i for i in range(self.args.N) if len(self.timestamps[i])==0]
         # remove from splits
-        self.dataset.splits = {k:np.setdiff1d(v,delete) for k,v in self.dataset.splits.items()}    
-        self.args.logger.write(str(len(delete)) + ' admissions removed.')   
-        
+        self.dataset.splits = {k:np.setdiff1d(v,delete) for k,v in self.dataset.splits.items()}
+        self.args.logger.write(str(len(delete)) + ' admissions removed.')
+
 
 class PreprocessorC_sup(PreprocessorC): # supervised
 
@@ -285,8 +286,8 @@ class PreprocessorC_sup(PreprocessorC): # supervised
         super().__init__(dataset)
         # If finetuning, load precomputed variables and normalization stats
         if self.args.train_mode == "finetune":
-            self.pt_variables, self.pt_means_stds = pickle.load(open(self.args.pt_var_path, 'rb'))   
-            
+            self.pt_variables, self.pt_means_stds = pickle.load(open(self.args.pt_var_path, 'rb'))
+
     def trim(self):
         # eliminate duplicate lab measurements
         self.data = self.data.groupby(["hadm_id", "ts_ind", "itemid","var_ind","minute"]).value.mean().reset_index()
@@ -294,12 +295,12 @@ class PreprocessorC_sup(PreprocessorC): # supervised
         self.data = self.data.groupby('hadm_id').head(self.args.max_obs) 
 
     def get_vars(self):
-        if self.args.train_mode == "finetune":  
+        if self.args.train_mode == "finetune":
             return self.pt_variables
         else:
             return sorted(self.data.itemid.unique())
-        
-    def compute_means_stds(self):  
+
+    def compute_means_stds(self):
         # strats can be pretrained and normalisation should use precomputed stats
         if self.args.train_mode == "finetune":
             return self.pt_means_stds
@@ -336,12 +337,17 @@ class PreprocessorEHRMamba(Preprocessor):
     REG_ID = 2
     UNK_ID = 3
     LAB_ID_OFFSET = 4
+    N_VALUE_BINS = 5
 
     def prepare_inputs(self):
         args = self.args
         logger = args.logger
 
-        # Exact minute timestamps required for continuous Time2Vec event_times
+        self.value_encoding = str(getattr(args, "value_encoding", "continuous")).lower()
+        args.value_encoding = self.value_encoding
+        if self.value_encoding not in ("continuous", "bins5"):
+            raise ValueError(f"Unknown value_encoding: {self.value_encoding}")
+
         if getattr(args, "drop_minutes", False):
             raise ValueError(
                 "ehrmamba_lab requires drop_minutes=False "
@@ -365,7 +371,7 @@ class PreprocessorEHRMamba(Preprocessor):
         logger.write(
             f"\nEHRMamba-Lab vocab_size={vocab_size} "
             f"(#labs={len(self.variables)}) days={days} "
-            f"max_minutes={max_minutes}"
+            f"max_minutes={max_minutes} value_encoding={self.value_encoding}"
         )
 
         data = self.data.copy()
@@ -414,28 +420,57 @@ class PreprocessorEHRMamba(Preprocessor):
         train_rows = data[data["ts_ind"].isin(self.train_ind)]
 
         if train_rows.empty:
-            raise ValueError("No training lab events available for normalization.")
+            raise ValueError("No training lab events available for value encoding.")
 
-        stats = (
-            train_rows.groupby("itemid")["value"]
-            .agg(["mean", "std"])
-            .reindex(self.variables)
-        )
+        means = {}
+        stds = {}
+        bin_edges = {}
 
-        means = stats["mean"].fillna(0.0).to_dict()
-        stds_raw = stats["std"].replace(0, np.nan).fillna(1.0).to_dict()
-        stds = {k: (v if v > 1e-6 else 1.0) for k, v in stds_raw.items()}
+        if self.value_encoding == "continuous":
+            stats = (
+                train_rows.groupby("itemid")["value"]
+                .agg(["mean", "std"])
+                .reindex(self.variables)
+            )
+            means = stats["mean"].fillna(0.0).to_dict()
+            stds_raw = stats["std"].replace(0, np.nan).fillna(1.0).to_dict()
+            stds = {k: (v if v > 1e-6 else 1.0) for k, v in stds_raw.items()}
 
-        def norm_value(itemid, val):
-            return (val - means.get(itemid, 0.0)) / stds.get(itemid, 1.0)
+            def encode_value(itemid, val):
+                return (val - means.get(itemid, 0.0)) / stds.get(itemid, 1.0)
 
-        data["value_norm"] = [
-            norm_value(i, v)
-            for i, v in zip(data["itemid"], data["value"])
-        ]
+            data["value_encoded"] = [
+                encode_value(i, v)
+                for i, v in zip(data["itemid"], data["value"])
+            ]
+            if not np.isfinite(data["value_encoded"].to_numpy(dtype=float)).all():
+                raise ValueError("Found non-finite normalized lab values")
 
-        if not np.isfinite(data["value_norm"].to_numpy(dtype=float)).all():
-            raise ValueError("Found non-finite normalized lab values")
+        else:
+            qs = [0.2, 0.4, 0.6, 0.8]
+            for itemid, g in train_rows.groupby("itemid"):
+                edges = np.quantile(g["value"].to_numpy(dtype=float), qs).astype(float)
+                bin_edges[itemid] = edges
+
+            for itemid in self.variables:
+                if itemid not in bin_edges:
+                    bin_edges[itemid] = np.array([], dtype=float)
+
+            def encode_value(itemid, val):
+                edges = bin_edges[itemid]
+                if len(edges) == 0:
+                    return 0
+                return int(np.searchsorted(edges, val, side="right"))
+
+            data["value_encoded"] = [
+                encode_value(i, v)
+                for i, v in zip(data["itemid"], data["value"])
+            ]
+            bins = data["value_encoded"].to_numpy(dtype=int)
+            if (bins < 0).any() or (bins >= self.N_VALUE_BINS).any():
+                raise ValueError(
+                    f"value bins out of range [0, {self.N_VALUE_BINS - 1}]"
+                )
 
         data["event_time"] = data["minute"].astype(np.float32) / 60.0
 
@@ -448,7 +483,10 @@ class PreprocessorEHRMamba(Preprocessor):
             raise ValueError(f"ts_ind out of range [0, {N})")
 
         event_ids = np.zeros((N, max_seq_len), dtype=np.int64)
-        values = np.zeros((N, max_seq_len), dtype=np.float32)
+        if self.value_encoding == "continuous":
+            values = np.zeros((N, max_seq_len), dtype=np.float32)
+        else:
+            values = np.zeros((N, max_seq_len), dtype=np.int64)
         event_mask = np.zeros((N, max_seq_len), dtype=np.float32)
         event_times = np.zeros((N, max_seq_len), dtype=np.float32)
         lengths = np.zeros(N, dtype=np.int64)
@@ -469,7 +507,7 @@ class PreprocessorEHRMamba(Preprocessor):
             ts_ind = int(ts_ind)
 
             ev = g[
-                ["event_id", "value_norm", "event_time"]
+                ["event_id", "value_encoded", "event_time"]
             ].to_numpy()
 
             n_events = len(ev)
@@ -482,7 +520,10 @@ class PreprocessorEHRMamba(Preprocessor):
                 ev = ev[-capacity:]
 
             seq_event = [self.CLS_ID] + ev[:, 0].astype(int).tolist() + [self.REG_ID]
-            seq_val = [0.0] + ev[:, 1].astype(float).tolist() + [0.0]
+            if self.value_encoding == "continuous":
+                seq_val = [0.0] + ev[:, 1].astype(float).tolist() + [0.0]
+            else:
+                seq_val = [0] + ev[:, 1].astype(int).tolist() + [0]
             seq_time = [0.0] + ev[:, 2].astype(float).tolist() + [0.0]
             seq_event_mask = [0.0] + [1.0] * len(ev) + [0.0]
 
@@ -565,6 +606,8 @@ class PreprocessorEHRMamba(Preprocessor):
             "lengths": lengths,
             "lab_means": means,
             "lab_stds": stds,
+            "lab_bin_edges": bin_edges,
+            "value_encoding": self.value_encoding,
             "vocab_size": vocab_size,
             "max_seq_len": max_seq_len,
         }

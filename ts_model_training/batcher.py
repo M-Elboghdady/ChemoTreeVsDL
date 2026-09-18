@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from ts_model_training.primenet.collator import CLDataCollator ##new primenet
 from ts_model_training.cycler import CycleIndex, CycleIndexBalanced
 
 class Batcher:
@@ -222,12 +223,19 @@ class BatcherEHRMamba(Batcher):
         self.event_mask = self.input_dict["event_mask"]
         self.event_times = self.input_dict["event_times"]
         self.lengths = self.input_dict["lengths"]
+        self.value_encoding = str(
+            getattr(args, "value_encoding", input_dict.get("value_encoding", "continuous"))
+        ).lower()
 
     def get_batch(self, ind=None):
         ind = self._get_indices(ind)
+        if self.value_encoding == "continuous":
+            values = torch.FloatTensor(self.values[ind])
+        else:
+            values = torch.LongTensor(self.values[ind])
         return {
             "event_ids": torch.LongTensor(self.event_ids[ind]),
-            "values": torch.FloatTensor(self.values[ind]),
+            "values": values,
             "event_mask": torch.FloatTensor(self.event_mask[ind]),
             "event_times": torch.FloatTensor(self.event_times[ind]),
             "lengths": torch.LongTensor(self.lengths[ind]),
