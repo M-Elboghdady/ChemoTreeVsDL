@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from ts_model_training.primenet.collator import CLDataCollator ##new primenet
+#from ts_model_training.primenet.collator import CLDataCollator ##new primenet
 from ts_model_training.cycler import CycleIndex, CycleIndexBalanced
 
 class Batcher:
@@ -241,4 +241,138 @@ class BatcherEHRMamba(Batcher):
             "lengths": torch.LongTensor(self.lengths[ind]),
             "demo": torch.FloatTensor(self.demo[ind]),
             "labels": torch.FloatTensor(self.y[ind]),
+        }
+
+
+class BatcherEHRMambaPretrain(Batcher):
+    PAD_ID = 0
+    CLS_ID = 1
+    REG_ID = 2
+    UNK_ID = 3
+    LAB_ID_OFFSET = 4
+
+    def __init__(self, args, input_dict):
+        super().__init__(args, input_dict)
+
+        self.event_ids = input_dict["event_ids"]
+        self.values = input_dict["values"]
+        self.event_mask = input_dict["event_mask"]
+        self.event_times = input_dict["event_times"]
+        self.lengths = input_dict["lengths"]
+        self.timestamps = input_dict["timestamps"]
+
+        self.max_seq_len = int(input_dict["max_seq_len"])
+        self.V = int(args.V)
+
+        if str(input_dict.get("value_encoding", "continuous")).lower() != "continuous":
+            raise ValueError("BatcherEHRMambaPretrain requires continuous values")
+
+        expected_V = int(input_dict["vocab_size"]) - self.LAB_ID_OFFSET
+        if self.V != expected_V:
+            raise ValueError(
+                f"V mismatch: args.V={self.V}, vocab implies V={expected_V}"
+            )
+
+        self.forecast_h = float(args.window_forecast) / 60.0
+        self.pred_h = float(args.window_pred) / 60.0
+
+    def _lab_arrays(self, i):
+        L = int(self.lengths[i])
+        pos = np.arange(1, L - 1, dtype=np.int64)
+        pos = pos[self.event_mask[i, pos] > 0.5]
+
+        return (
+            self.event_ids[i, pos].astype(np.int64),
+            self.values[i, pos].astype(np.float32),
+            self.event_times[i, pos].astype(np.float32),
+        )
+
+    def _build_one(self, i):
+        cuts = self.timestamps[i]
+        if cuts is None or len(cuts) == 0:
+            raise RuntimeError(f"No valid cutoff for admission {i}")
+
+        t1 = float(np.random.choice(np.asarray(cuts, dtype=np.float32)))
+        event_ids, values, times_h = self._lab_arrays(i)
+
+        past_ix = np.where(
+            (times_h < t1) & (times_h >= t1 - self.forecast_h)
+        )[0]
+        fut_ix = np.where(
+            (times_h >= t1) & (times_h < t1 + self.pred_h)
+        )[0]
+
+        if past_ix.size == 0 or fut_ix.size == 0:
+            raise RuntimeError(f"Invalid cutoff for admission {i}")
+
+        capacity = self.max_seq_len - 2
+        if past_ix.size > capacity:
+            past_ix = past_ix[-capacity:]
+
+        forecast_values = np.zeros(self.V, dtype=np.float32)
+        forecast_mask = np.zeros(self.V, dtype=np.float32)
+
+        for j in fut_ix[::-1]:
+            eid = int(event_ids[j])
+            if eid < self.LAB_ID_OFFSET:
+                continue
+
+            v = eid - self.LAB_ID_OFFSET
+            if 0 <= v < self.V and forecast_mask[v] == 0:
+                forecast_values[v] = float(values[j])
+                forecast_mask[v] = 1.0
+
+        if forecast_mask.sum() == 0:
+            raise RuntimeError(f"No forecast targets for admission {i}")
+
+        n = len(past_ix)
+        L = n + 2
+
+        out_ids = np.zeros(self.max_seq_len, dtype=np.int64)
+        out_vals = np.zeros(self.max_seq_len, dtype=np.float32)
+        out_mask = np.zeros(self.max_seq_len, dtype=np.float32)
+        out_times = np.zeros(self.max_seq_len, dtype=np.float32)
+
+        out_ids[0] = self.CLS_ID
+        out_ids[1:1+n] = event_ids[past_ix]
+        out_ids[1+n] = self.REG_ID
+
+        out_vals[1:1+n] = values[past_ix]
+        out_mask[1:1+n] = 1.0
+        out_times[1:1+n] = times_h[past_ix]
+
+        return out_ids, out_vals, out_mask, out_times, L, forecast_values, forecast_mask
+
+    def get_batch(self, ind=None):
+        ind = self._get_indices(ind)
+        B, S = len(ind), self.max_seq_len
+
+        event_ids = np.zeros((B, S), dtype=np.int64)
+        values = np.zeros((B, S), dtype=np.float32)
+        event_mask = np.zeros((B, S), dtype=np.float32)
+        event_times = np.zeros((B, S), dtype=np.float32)
+        lengths = np.zeros(B, dtype=np.int64)
+        forecast_values = np.zeros((B, self.V), dtype=np.float32)
+        forecast_mask = np.zeros((B, self.V), dtype=np.float32)
+
+        for b, i in enumerate(ind):
+            ids, vals, mask, times, L, fv, fm = self._build_one(i)
+
+            event_ids[b] = ids
+            values[b] = vals
+            event_mask[b] = mask
+            event_times[b] = times
+            lengths[b] = L
+            forecast_values[b] = fv
+            forecast_mask[b] = fm
+
+        return {
+            "event_ids": torch.LongTensor(event_ids),
+            "values": torch.FloatTensor(values),
+            "event_mask": torch.FloatTensor(event_mask),
+            "event_times": torch.FloatTensor(event_times),
+            "lengths": torch.LongTensor(lengths),
+            "demo": torch.FloatTensor(self.demo[ind]),
+            "forecast_values": torch.FloatTensor(forecast_values),
+            "forecast_mask": torch.FloatTensor(forecast_mask),
         }

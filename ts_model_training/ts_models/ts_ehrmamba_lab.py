@@ -73,6 +73,8 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
     def __init__(self, args):
         super().__init__(args)
         value_encoding = str(getattr(args, "value_encoding", "continuous"))
+        self.pretrain = args.train_mode == "pretrain"
+
         H = int(args.hid_dim)
         dropout = float(args.dropout)
         vocab_size = int(args.vocab_size)
@@ -93,7 +95,31 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         self.final_norm = nn.LayerNorm(H)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, event_ids, values, event_mask, event_times, lengths, demo, labels=None):
+        if self.pretrain:
+            self.forecast_head = nn.Linear(H, int(args.V))
+
+    def forecast_loss(self, ts_emb, forecast_values, forecast_mask):
+        pred = self.forecast_head(ts_emb)
+        mask = forecast_mask.float()
+        denom = mask.sum()
+
+        if denom.item() == 0:
+            raise RuntimeError("EHRMamba pretrain batch has no forecast targets")
+
+        return (mask * (pred - forecast_values) ** 2).sum() / denom
+
+    def forward(
+        self,
+        event_ids,
+        values,
+        event_mask,
+        event_times,
+        lengths,
+        demo,
+        labels=None,
+        forecast_values=None,
+        forecast_mask=None,
+    ):
         x = self.embedding(event_ids, values, event_mask, event_times)
 
         h = x
@@ -107,9 +133,14 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         ts_emb = C[batch_ix, idx]
         ts_emb = self.dropout(ts_emb)
 
+        if self.pretrain:
+            loss = self.forecast_loss(ts_emb, forecast_values, forecast_mask)
+            return loss, ts_emb
+
         demo_emb = self.demo_emb(demo)
         ts_demo_emb = torch.cat((ts_emb, demo_emb), dim=-1)
 
         logits = self.binary_head(ts_demo_emb)[:, 0]
 
         return logits, ts_demo_emb
+

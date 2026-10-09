@@ -51,7 +51,7 @@ class Preprocessor:
             self.input_dict["target"] = self.dataset.y
 
         # pickle dump only if not training in nested crossvalidation
-        if not (self.args.cv_mode == "grid"): #self.args.grid == "nested" and
+        if not (self.args.cv_mode == "grid") and self.args.model_type != "ehrmamba_lab": #self.args.grid == "nested" and
             output_path = Path(self.dataset.args.paths["output_path"]) / "input_dict.pkl"
             with open(output_path, "wb") as f:
                 pickle.dump(self.input_dict, f)
@@ -234,7 +234,7 @@ class PreprocessorC_unsup(PreprocessorC): # unsupervised
         self.data = self.data.groupby(["hadm_id", "ts_ind", "itemid","var_ind","minute"]).value.mean().reset_index()
         #self.data = self.data.sample(frac=1)
         #self.data = self.data.groupby('hadm_id').head(self.args.max_obs) # trimming is applied at batching stage
-    
+
     def get_vars(self):
         self.pt_variables = sorted(self.data.itemid.unique())
         return self.pt_variables
@@ -292,7 +292,7 @@ class PreprocessorC_sup(PreprocessorC): # supervised
         # eliminate duplicate lab measurements
         self.data = self.data.groupby(["hadm_id", "ts_ind", "itemid","var_ind","minute"]).value.mean().reset_index()
         self.data = self.data.sample(frac=1)
-        self.data = self.data.groupby('hadm_id').head(self.args.max_obs) 
+        self.data = self.data.groupby('hadm_id').head(self.args.max_obs)
 
     def get_vars(self):
         if self.args.train_mode == "finetune":
@@ -348,6 +348,26 @@ class PreprocessorEHRMamba(Preprocessor):
         if self.value_encoding not in ("continuous", "bins5"):
             raise ValueError(f"Unknown value_encoding: {self.value_encoding}")
 
+        finetune = args.train_mode == "finetune"
+        pt_means, pt_stds, pt_bin_edges = {}, {}, {}
+        if finetune:
+            with open(args.pt_var_path, "rb") as f:
+                payload = pickle.load(f)
+            self.value_encoding = str(payload["value_encoding"]).lower()
+            args.value_encoding = self.value_encoding
+            self.variables = list(payload["variables"])
+            self.var_to_ind = dict(payload["var_to_ind"])
+            pt_means = dict(payload.get("lab_means") or {})
+            pt_stds = dict(payload.get("lab_stds") or {})
+            pt_bin_edges = dict(payload.get("lab_bin_edges") or {})
+            vocab_size = int(payload["vocab_size"])
+            args.vocab_size = vocab_size
+            args.V = len(self.variables)
+            logger.write(
+                f"\nEHRMamba-Lab FINETUNE: reused pt vocab_size={vocab_size} "
+                f"(#labs={len(self.variables)}) encoding={self.value_encoding}"
+            )
+
         if getattr(args, "drop_minutes", False):
             raise ValueError(
                 "ehrmamba_lab requires drop_minutes=False "
@@ -361,18 +381,19 @@ class PreprocessorEHRMamba(Preprocessor):
         days = int(getattr(args, "days_before_discharge", 14))
         max_minutes = (days + 1) * 24 * 60
 
-        self.variables = sorted(self.data.itemid.astype(str).unique())
-        self.var_to_ind = {v: i + self.LAB_ID_OFFSET for i, v in enumerate(self.variables)}
+        if not finetune:
+            self.variables = sorted(self.data.itemid.astype(str).unique())
+            self.var_to_ind = {v: i + self.LAB_ID_OFFSET for i, v in enumerate(self.variables)}
 
-        vocab_size = self.LAB_ID_OFFSET + len(self.variables)
-        args.vocab_size = vocab_size
-        args.V = len(self.variables)
+            vocab_size = self.LAB_ID_OFFSET + len(self.variables)
+            args.vocab_size = vocab_size
+            args.V = len(self.variables)
 
-        logger.write(
-            f"\nEHRMamba-Lab vocab_size={vocab_size} "
-            f"(#labs={len(self.variables)}) days={days} "
-            f"max_minutes={max_minutes} value_encoding={self.value_encoding}"
-        )
+            logger.write(
+                f"\nEHRMamba-Lab vocab_size={vocab_size} "
+                f"(#labs={len(self.variables)}) days={days} "
+                f"max_minutes={max_minutes} value_encoding={self.value_encoding}"
+            )
 
         data = self.data.copy()
 
@@ -388,6 +409,9 @@ class PreprocessorEHRMamba(Preprocessor):
             )["value"]
             .mean()
         )
+
+        if finetune:
+            data = data[data["itemid"].isin(self.variables)]
 
         data["event_id"] = (
             data["itemid"]
@@ -419,7 +443,7 @@ class PreprocessorEHRMamba(Preprocessor):
 
         train_rows = data[data["ts_ind"].isin(self.train_ind)]
 
-        if train_rows.empty:
+        if (not finetune) and train_rows.empty:
             raise ValueError("No training lab events available for value encoding.")
 
         means = {}
@@ -427,14 +451,17 @@ class PreprocessorEHRMamba(Preprocessor):
         bin_edges = {}
 
         if self.value_encoding == "continuous":
-            stats = (
-                train_rows.groupby("itemid")["value"]
-                .agg(["mean", "std"])
-                .reindex(self.variables)
-            )
-            means = stats["mean"].fillna(0.0).to_dict()
-            stds_raw = stats["std"].replace(0, np.nan).fillna(1.0).to_dict()
-            stds = {k: (v if v > 1e-6 else 1.0) for k, v in stds_raw.items()}
+            if finetune:
+                means, stds = pt_means, pt_stds
+            else:
+                stats = (
+                    train_rows.groupby("itemid")["value"]
+                    .agg(["mean", "std"])
+                    .reindex(self.variables)
+                )
+                means = stats["mean"].fillna(0.0).to_dict()
+                stds_raw = stats["std"].replace(0, np.nan).fillna(1.0).to_dict()
+                stds = {k: (v if v > 1e-6 else 1.0) for k, v in stds_raw.items()}
 
             def encode_value(itemid, val):
                 return (val - means.get(itemid, 0.0)) / stds.get(itemid, 1.0)
@@ -447,14 +474,17 @@ class PreprocessorEHRMamba(Preprocessor):
                 raise ValueError("Found non-finite normalized lab values")
 
         else:
-            qs = [0.2, 0.4, 0.6, 0.8]
-            for itemid, g in train_rows.groupby("itemid"):
-                edges = np.quantile(g["value"].to_numpy(dtype=float), qs).astype(float)
-                bin_edges[itemid] = edges
+            if finetune:
+                bin_edges = pt_bin_edges
+            else:
+                qs = [0.2, 0.4, 0.6, 0.8]
+                for itemid, g in train_rows.groupby("itemid"):
+                    edges = np.quantile(g["value"].to_numpy(dtype=float), qs).astype(float)
+                    bin_edges[itemid] = edges
 
-            for itemid in self.variables:
-                if itemid not in bin_edges:
-                    bin_edges[itemid] = np.array([], dtype=float)
+                for itemid in self.variables:
+                    if itemid not in bin_edges:
+                        bin_edges[itemid] = np.array([], dtype=float)
 
             def encode_value(itemid, val):
                 edges = bin_edges[itemid]
@@ -623,3 +653,82 @@ class PreprocessorEHRMamba(Preprocessor):
         logger.write(
             "EHRMamba-Lab event sequences prepared (no V/M/D)."
         )
+
+class PreprocessorEHRMamba_unsup(PreprocessorEHRMamba):
+    """Prepares EHRMamba-Lab inputs for future-value pretraining."""
+
+    def dump_pt_stats(self):
+        """Saves vocabulary and normalization metadata."""
+        pt_var_path = os.path.join(self.args.paths["output_path"], "pt_saved_variables.pkl")
+        payload = {
+            "variables": list(self.variables),
+            "var_to_ind": dict(self.var_to_ind),
+            "lab_means": self.input_dict["lab_means"],
+            "lab_stds": self.input_dict["lab_stds"],
+            "lab_bin_edges": self.input_dict.get("lab_bin_edges", {}),
+            "value_encoding": self.input_dict["value_encoding"],
+            "vocab_size": int(self.input_dict["vocab_size"]),
+        }
+        with open(pt_var_path, "wb") as f:
+            pickle.dump(payload, f)
+        self.args.logger.write(f"Saved EHRMamba pretrain metadata → {pt_var_path}")
+
+    def _valid_cuts_for_admission(self, i, forecast_h, pred_h, min_cut_h):
+        """Returns valid forecasting cutoff times."""
+        L = int(self.input_dict["lengths"][i])
+        if L < 3:
+            return np.array([], dtype=np.float32)
+
+        pos = np.arange(1, L - 1, dtype=np.int64)
+        pos = pos[self.input_dict["event_mask"][i, pos] > 0.5]
+        if pos.size == 0:
+            return np.array([], dtype=np.float32)
+
+        times_h = self.input_dict["event_times"][i, pos].astype(np.float32)
+        uniq = np.unique(times_h)
+        if uniq.size < 2:
+            return np.array([], dtype=np.float32)
+
+        cands = []
+        for t1 in uniq[:-1]:
+            if t1 < min_cut_h:
+                continue
+            n_past = np.sum((times_h < t1) & (times_h >= t1 - forecast_h))
+            n_fut = np.sum((times_h >= t1) & (times_h < t1 + pred_h))
+            if n_past > 0 and n_fut > 0:
+                cands.append(float(t1))
+        return np.asarray(cands, dtype=np.float32)
+
+    def prepare_inputs(self):
+        """Adds forecasting cutoffs and saves pretraining metadata."""
+        enc = str(getattr(self.args, "value_encoding", "continuous")).lower()
+        if enc != "continuous":
+            raise ValueError(
+                "PreprocessorEHRMamba_unsup requires value_encoding='continuous' "
+                f"(got '{enc}')."
+            )
+
+        self.args.value_encoding = "continuous"
+        super().prepare_inputs()
+
+        forecast_h = float(self.args.window_forecast) / 60.0
+        pred_h = float(self.args.window_pred) / 60.0
+        min_cut_h = 720.0 / 60.0
+        N = int(self.args.N)
+
+        timestamps = [
+            self._valid_cuts_for_admission(i, forecast_h, pred_h, min_cut_h)
+            for i in range(N)
+        ]
+        self.input_dict["timestamps"] = timestamps
+
+        delete = [i for i in range(N) if len(timestamps[i]) == 0]
+        self.dataset.splits = {
+            k: np.setdiff1d(v, delete) for k, v in self.dataset.splits.items()
+        }
+        self.args.logger.write(
+            f"EHRMamba pretrain: removed {len(delete)} admissions with no valid cutoff."
+        )
+
+        self.dump_pt_stats()
+

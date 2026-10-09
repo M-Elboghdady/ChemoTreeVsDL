@@ -9,7 +9,7 @@ from ts_model_training.ts_models.mlp import MLP
 from ts_model_training.ts_models.ts_mamba import MAMBA_TS
 from ts_model_training.ts_models.ts_mamba_fusion import MAMBA_FUSION_TS
 from ts_model_training.ts_models.ts_ehrmamba_lab import EHRMAMBA_LAB_TS
-from ts_model_training.batcher import Batcher, BatcherA, BatcherB, BatcherC_sup, BatcherC_unsup, BatcherEHRMamba
+from ts_model_training.batcher import Batcher, BatcherA, BatcherB, BatcherC_sup, BatcherC_unsup, BatcherEHRMamba, BatcherEHRMambaPretrain
 
 MODEL_CLASSES = {
     'gru': GRU_TS,
@@ -40,6 +40,8 @@ def build_batcher(args, input_dict):
     model_type = args.model_type
     if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp', 'mamba', 'mamba_fusion']:
         batcher = BatcherA(args, input_dict)
+    elif model_type == "ehrmamba_lab" and args.train_mode == "pretrain":
+        batcher = BatcherEHRMambaPretrain(args, input_dict)
     elif model_type == 'ehrmamba_lab':
         batcher = BatcherEHRMamba(args, input_dict)
     elif model_type in ['grud', 'interpnet']:

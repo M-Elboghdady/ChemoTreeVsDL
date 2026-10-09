@@ -127,7 +127,8 @@ class EnvManager:
 
     def resolve_mode(self):
         # determine training mode and load checkpoint if provided.
-        if self.args.model_type == "strats" and self.args.load_ckpt_path is not None:
+        pretrainable_models = ("strats", "ehrmamba_lab")
+        if self.args.model_type in pretrainable_models and self.args.load_ckpt_path is not None:
             self.args.pt_var_path = Path(self.args.load_ckpt_path) / 'pt_saved_variables.pkl'
             self.args.pt_dict_path = Path(self.args.load_ckpt_path) / 'checkpoint_best.bin'
             try:
@@ -147,7 +148,7 @@ class EnvManager:
                 self.args.finetune = True
                 self.args.train_mode = "finetune"
 
-        elif self.args.model_type == "strats" and self.args.pretrain:
+        elif self.args.model_type in pretrainable_models and self.args.pretrain:
             self.args.train_mode = "pretrain"
 
         else:
@@ -250,12 +251,12 @@ class EnvManager:
         param_names = self._get_param_names()
             
         metric = "loss" if self.args.train_mode == "pretrain" else "auroc"
-
+        ascending = self.args.train_mode == "pretrain"
         best_tuple = (
             grid_res
             .groupby(param_names, dropna=False)[[metric, "epoch"]]
             .mean()
-            .sort_values(metric, ascending=False)
+            .sort_values(metric, ascending=ascending)
             .iloc[0]
         )
         # build dict of best params
