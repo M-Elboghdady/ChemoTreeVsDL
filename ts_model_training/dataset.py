@@ -140,7 +140,10 @@ class TimeSeriesDataset:
         if model_type in ['gru', 'lstm', 'tcn', 'sand', 'mlp', 'mamba', 'mamba_fusion']:
             self.preproc = PreprocessorA(self)
         elif model_type == "ehrmamba_lab" and self.args.train_mode == "pretrain":
-            self.preproc = PreprocessorEHRMamba_unsup(self)
+            if self.args.pretrain_protocol == "strats_matched":
+                self.preproc = PreprocessorC_unsup(self)
+            else:  # ehrmamba_adaptation
+                self.preproc = PreprocessorEHRMamba_unsup(self)
         elif model_type == 'ehrmamba_lab':
             self.preproc = PreprocessorEHRMamba(self)
         elif model_type in ['grud', 'interpnet']:

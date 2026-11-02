@@ -245,8 +245,26 @@ class PreprocessorC_unsup(PreprocessorC): # unsupervised
 
     def dump_stats(self):
         pt_var_path = os.path.join(self.args.paths["output_path"], 'pt_saved_variables.pkl')
+
+        if self.args.model_type == "ehrmamba_lab" and self.args.pretrain_protocol == "strats_matched":
+            variables = [str(v) for v in self.pt_variables]
+            stats = self.pt_means_stds.copy()
+            stats.index = stats.index.astype(str)
+
+            payload = {
+                "variables": variables,
+                "var_to_ind": {v: i + 4 for i, v in enumerate(variables)},
+                "lab_means": stats["mean"].to_dict(),
+                "lab_stds": stats["std"].to_dict(),
+                "lab_bin_edges": {},
+                "value_encoding": "continuous",
+                "vocab_size": len(variables) + 4,
+            }
+        else:
+            payload = (self.pt_variables, self.pt_means_stds)
+
         with open(pt_var_path, 'wb') as f:
-            pickle.dump((self.pt_variables, self.pt_means_stds), f)
+            pickle.dump(payload, f)
 
     def prepare_inputs(self):
         self.set_variables()

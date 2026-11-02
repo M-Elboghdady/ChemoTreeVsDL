@@ -244,7 +244,7 @@ class BatcherEHRMamba(Batcher):
         }
 
 
-class BatcherEHRMambaPretrain(Batcher):
+class BatcherEHRMambaPretrain(Batcher): # Ehrmamba lab adaptation from the paper 
     PAD_ID = 0
     CLS_ID = 1
     REG_ID = 2
@@ -375,4 +375,49 @@ class BatcherEHRMambaPretrain(Batcher):
             "demo": torch.FloatTensor(self.demo[ind]),
             "forecast_values": torch.FloatTensor(forecast_values),
             "forecast_mask": torch.FloatTensor(forecast_mask),
+        }
+
+class BatcherEHRMambaStratsPretrain(BatcherC_unsup): # Head-to-Head with strats
+    CLS_ID = 1
+    REG_ID = 2
+    LAB_ID_OFFSET = 4
+
+    def get_batch(self, ind=None):
+        batch = super().get_batch(ind)
+
+        values = batch["values"]
+        times = batch["times"]
+        varis = batch["varis"]
+        obs_mask = batch["obs_mask"]
+
+        B, L = values.shape
+        num_obs = obs_mask.sum(dim=1).long()
+
+        event_ids = torch.zeros((B, L + 2), dtype=torch.long)
+        event_values = torch.zeros((B, L + 2), dtype=torch.float)
+        event_mask = torch.zeros((B, L + 2), dtype=torch.float)
+        event_times = torch.zeros((B, L + 2), dtype=torch.float)
+        lengths = num_obs + 2
+
+        event_ids[:, 0] = self.CLS_ID
+
+        for b in range(B):
+            n = int(num_obs[b])
+
+            event_ids[b, 1:1+n] = varis[b, :n].long() + self.LAB_ID_OFFSET
+            event_values[b, 1:1+n] = values[b, :n]
+            event_times[b, 1:1+n] = times[b, :n]
+            event_mask[b, 1:1+n] = 1.0
+
+            event_ids[b, n+1] = self.REG_ID
+
+        return {
+            "event_ids": event_ids,
+            "values": event_values,
+            "event_mask": event_mask,
+            "event_times": event_times,
+            "lengths": lengths,
+            "demo": batch["demo"],
+            "forecast_values": batch["forecast_values"],
+            "forecast_mask": batch["forecast_mask"].float(),
         }

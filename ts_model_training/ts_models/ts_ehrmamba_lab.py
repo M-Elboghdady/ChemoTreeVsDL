@@ -74,10 +74,17 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         super().__init__(args)
         value_encoding = str(getattr(args, "value_encoding", "continuous"))
         self.pretrain = args.train_mode == "pretrain"
+        self.pretrain_protocol = getattr(args, "pretrain_protocol", "ehrmamba_adaptation")
+        self.V = int(args.V)
+        self.variable_mask_prob = float(args.dropout)
 
         H = int(args.hid_dim)
         dropout = float(args.dropout)
-        vocab_size = int(args.vocab_size)
+
+        if self.pretrain and self.pretrain_protocol == "strats_matched":
+            vocab_size = self.V + 4
+        else:
+            vocab_size = int(args.vocab_size)
 
         self.embedding = EHRLabEmbedding(vocab_size=vocab_size, d_model=H, dropout=dropout,value_encoding=value_encoding)
 
@@ -96,7 +103,37 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         self.dropout = nn.Dropout(dropout)
 
         if self.pretrain:
-            self.forecast_head = nn.Linear(H, int(args.V))
+            if self.pretrain_protocol == "strats_matched":
+                self.forecast_head = nn.Linear(self.ts_demo_emb_size, int(args.V))
+            else:
+                self.forecast_head = nn.Linear(H, int(args.V))
+
+    def _apply_strats_variable_mask(self, event_ids, values, event_mask, event_times, lengths):
+        B = event_ids.size(0)
+        var_mask = torch.rand((B, self.V), device=event_ids.device) <= self.variable_mask_prob
+
+        out_ids = torch.zeros_like(event_ids)
+        out_values = torch.zeros_like(values)
+        out_mask = torch.zeros_like(event_mask)
+        out_times = torch.zeros_like(event_times)
+        out_lengths = torch.zeros_like(lengths)
+
+        out_ids[:, 0] = CLS_ID
+
+        for b in range(B):
+            L = int(lengths[b].item())
+            ids = event_ids[b, 1:L-1]
+            keep = ~var_mask[b, (ids - LAB_ID_OFFSET).long()]
+            n = int(keep.sum().item())
+
+            out_ids[b, 1:1+n] = ids[keep]
+            out_values[b, 1:1+n] = values[b, 1:L-1][keep]
+            out_mask[b, 1:1+n] = event_mask[b, 1:L-1][keep]
+            out_times[b, 1:1+n] = event_times[b, 1:L-1][keep]
+            out_ids[b, n+1] = REG_ID
+            out_lengths[b] = n + 2
+
+        return out_ids, out_values, out_mask, out_times, out_lengths
 
     def forecast_loss(self, ts_emb, forecast_values, forecast_mask):
         pred = self.forecast_head(ts_emb)
@@ -120,6 +157,11 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         forecast_values=None,
         forecast_mask=None,
     ):
+        if self.training and self.pretrain and self.pretrain_protocol == "strats_matched":
+            event_ids, values, event_mask, event_times, lengths = self._apply_strats_variable_mask(
+                event_ids, values, event_mask, event_times, lengths
+            )
+
         x = self.embedding(event_ids, values, event_mask, event_times)
 
         h = x
@@ -134,8 +176,13 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         ts_emb = self.dropout(ts_emb)
 
         if self.pretrain:
-            loss = self.forecast_loss(ts_emb, forecast_values, forecast_mask)
-            return loss, ts_emb
+            if self.pretrain_protocol == "strats_matched":
+                demo_emb = self.demo_emb(demo)
+                pretrain_emb = torch.cat((ts_emb, demo_emb), dim=-1)
+            else:
+                pretrain_emb = ts_emb
+            loss = self.forecast_loss(pretrain_emb, forecast_values, forecast_mask)
+            return loss, pretrain_emb
 
         demo_emb = self.demo_emb(demo)
         ts_demo_emb = torch.cat((ts_emb, demo_emb), dim=-1)
@@ -143,4 +190,3 @@ class EHRMAMBA_LAB_TS(TimeSeriesModel):
         logits = self.binary_head(ts_demo_emb)[:, 0]
 
         return logits, ts_demo_emb
-

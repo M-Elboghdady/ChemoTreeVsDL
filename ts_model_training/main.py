@@ -15,6 +15,8 @@ parser.add_argument("--fold", type=int, default=0)
 parser.add_argument("--model_type", type=str, default="strats")
 parser.add_argument("--grid", type=str, default="none")
 parser.add_argument("--pretrain", action="store_true", help="Enable pretraining mode")
+parser.add_argument("--pretrain_protocol", type=str, default="ehrmamba_adaptation",
+                    choices=["ehrmamba_adaptation", "strats_matched"]) # ehrmamba_lab pretraining protocol: Ehrmamba-lab adaptation(not exactly as the paper) or STraTS-matched setup (head-to-head comparision)
 parser.add_argument("--feature_threshold", action="store_true", help="Select top 100 features in MIMIC")
 parser.add_argument("--load_ckpt_path", type=str, default=None)
 parser.add_argument("--prefix", type=str, default=None)
