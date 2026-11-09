@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 from ts_model_training.utils import discrete_tensors, fill_impute, fill_mean, compute_means_stds_df, compute_deltas, compute_holdout
 from pathlib import Path
+from config.constants import PROJECT_ROOT, MIMIC_DIR
+import gc
+import shutil
+import pickle
+
 class Preprocessor:
     def __init__(self, dataset):
         self.dataset = dataset
@@ -750,3 +755,616 @@ class PreprocessorEHRMamba_unsup(PreprocessorEHRMamba):
 
         self.dump_pt_stats()
 
+
+class PreprocessorEHRMambaPaper(Preprocessor):
+    SPECIAL_TOKENS=["[PAD]","[UNK]","[MASK]","[CLS]","[VS]","[VE]","[REG]",
+                    "[W0]","[W1]","[W2]","[W3]","[M0]","[M1]","[M2]","[M3]",
+                    "[M4]","[M5]","[M6]","[M7]","[M8]","[M9]","[M10]","[M11]",
+                    "[M12]","[LT]"]
+    N_BUCKETS=64
+    COLS=["subject_id","hadm_id","event_time","concept_id","lab_itemid","lab_value"]
+
+    def __init__(self,dataset):
+        super().__init__(dataset)
+        self.mimic_dir=Path(MIMIC_DIR)
+        self.pt_meta=pickle.load(open(self.args.pt_var_path,"rb")) if self.args.train_mode!="pretrain" else None
+
+    def _event_cache_dir(self):
+        return Path(self.args.paths["saved_data_path"])/"ehrmamba_paper_event_cache"/self.args.cohort
+
+    def _parse_time(self,x):
+        return pd.to_datetime(x,format="mixed")
+
+    def _write_events(self,x):
+        if x.empty:return
+        x=x[self.COLS].copy()
+        x["_b"]=x.subject_id.astype(np.int64)%self.N_BUCKETS
+        for b,g in x.groupby("_b",sort=False):
+            p=self._cache/f"bucket_{int(b):02d}.csv.gz"
+            g[self.COLS].to_csv(p,mode="a",index=False,header=not p.exists(),
+                                compression={"method":"gzip","compresslevel":1})
+
+    def _build_event_cache(self,subjects):
+        self._cache=self._event_cache_dir()
+        ready,sf=self._cache/"READY",self._cache/"subjects.pkl"
+        subjects=set(map(int,subjects))
+
+        if ready.exists() and sf.exists() and pickle.load(open(sf,"rb"))==subjects:
+            self.args.logger.write(f"\nUsing event cache: {self._cache}")
+            return
+
+        if self._cache.exists():shutil.rmtree(self._cache)
+        self._cache.mkdir(parents=True)
+
+        for x in pd.read_csv(self.mimic_dir/"hosp/labevents.csv.gz",
+                             usecols=["subject_id","hadm_id","itemid","charttime","valuenum"],
+                             chunksize=1_000_000):
+            x=x[x.subject_id.isin(subjects)&x.charttime.notna()&x.valuenum.notna()]
+            if x.empty:continue
+            y=x[["subject_id","hadm_id"]].copy()
+            y["event_time"]=x.charttime
+            y["concept_id"]="LAB_"+x.itemid.astype(str)
+            y["lab_itemid"]=x.itemid.astype(str)
+            y["lab_value"]=x.valuenum.astype(float)
+            self._write_events(y)
+        self.args.logger.write("\nCached labs")
+
+        for x in pd.read_csv(self.mimic_dir/"hosp/prescriptions.csv.gz",
+                             usecols=["subject_id","hadm_id","starttime","stoptime","drug","gsn"],
+                             chunksize=1_000_000,dtype={"drug":"string","gsn":"string"}):
+            x=x[x.subject_id.isin(subjects)&x.drug.notna()].copy()
+            if x.empty:continue
+            drug=x.drug.astype(str).str.strip()
+            gsn=x.gsn.fillna("UNK").astype(str)
+            for col,state in [("starttime","STARTED"),("stoptime","STOPPED")]:
+                m=x[col].notna()
+                if not m.any():continue
+                y=x.loc[m,["subject_id","hadm_id"]].copy()
+                y["event_time"]=x.loc[m,col]
+                y["concept_id"]="MEDICATION//"+state+"//"+drug.loc[m]+"//"+gsn.loc[m]
+                y["lab_itemid"],y["lab_value"]=pd.NA,np.nan
+                self._write_events(y)
+        self.args.logger.write("\nCached medications")
+
+        for x in pd.read_csv(self.mimic_dir/"hosp/procedures_icd.csv.gz",
+                             usecols=["subject_id","hadm_id","chartdate","icd_code","icd_version"],
+                             chunksize=1_000_000,dtype={"icd_code":"string"}):
+            x=x[x.subject_id.isin(subjects)&x.icd_code.notna()&x.chartdate.notna()].copy()
+            if x.empty:continue
+            y=x[["subject_id","hadm_id"]].copy()
+            y["event_time"]=x.chartdate
+            y["concept_id"]="PROCEDURE//ICD//"+x.icd_version.astype(str)+"//"+x.icd_code.astype(str)
+            y["lab_itemid"],y["lab_value"]=pd.NA,np.nan
+            self._write_events(y)
+        self.args.logger.write("\nCached procedures")
+
+        pickle.dump(subjects,open(sf,"wb"),protocol=pickle.HIGHEST_PROTOCOL)
+        ready.touch()
+
+    def _load_admissions(self,subjects):
+        x=pd.read_csv(self.mimic_dir/"hosp/admissions.csv.gz",
+                      usecols=["subject_id","hadm_id","admittime","dischtime"])
+        x=x[x.subject_id.isin(subjects)].copy()
+        x["admittime"]=pd.to_datetime(x.admittime)
+        x["dischtime"]=pd.to_datetime(x.dischtime)
+        return {int(s):(g.admittime.to_numpy("datetime64[ns]"),
+                        g.dischtime.to_numpy("datetime64[ns]"),
+                        g.hadm_id.to_numpy())
+                for s,g in x.groupby("subject_id",sort=False)}
+
+    def _load_ages(self,subjects):
+        x=pd.read_csv(self.mimic_dir/"hosp/patients.csv.gz",
+                      usecols=["subject_id","anchor_age","anchor_year"])
+        return {int(r.subject_id):(float(r.anchor_age),int(r.anchor_year))
+                for r in x[x.subject_id.isin(subjects)].itertuples(index=False)}
+
+    def _attach_hadm(self,g,admissions):
+        m=g.hadm_id.isna()
+        if not m.any():return g
+        a=admissions.get(int(g.subject_id.iloc[0]))
+        if a is None:return g
+        t=g.loc[m,"event_time"].to_numpy("datetime64[ns]")
+        start,end,ids=a
+        match=(t[:,None]>=start)&(t[:,None]<=end)
+        ok=match.any(axis=1)
+        if ok.any():
+            j=match.argmax(axis=1)
+            idx=g.index[m].to_numpy()
+            g.loc[idx[ok],"hadm_id"]=ids[j[ok]]
+        return g
+
+    def _encode_labs(self,x,edges):
+        m=x.lab_itemid.notna()
+        if not m.any():return x
+        ids=x.loc[m,"lab_itemid"].astype(str)
+        vals=x.loc[m,"lab_value"].astype(float)
+        x.loc[m,"concept_id"]=[
+            f"LAB_{i}//BIN{np.searchsorted(edges[i],v,side='right')}"
+            if i in edges else f"LAB_{i}//BINUNK"
+            for i,v in zip(ids,vals)
+        ]
+        return x
+
+    def assign_visits(self,events):
+        x=events.sort_values("event_time",kind="stable").copy()
+        x["visit_order"]=pd.factorize(x.hadm_id,sort=False)[0]+1
+        x["visit_segment"]=((x.visit_order-1)%2)+1
+        return x
+
+    def time_token(self,t1,t2):
+        d=max(0.,(t2-t1).total_seconds()/86400.)
+        if d<28:return f"[W{min(3,int(d//7))}]"
+        m=int(d//30.44)
+        return f"[M{m}]" if m<=12 else "[LT]"
+
+    def build_sequence(self,events):
+        x=self.assign_visits(events)
+        seq=[{"token":"[CLS]","visit_order":0,"visit_segment":0,"event_time":pd.NaT}]
+        prev=None
+
+        for vo,g in x.groupby("visit_order",sort=True):
+            g=g.sort_values("event_time",kind="stable")
+            seg=int(g.visit_segment.iloc[0])
+            start,end=g.event_time.iloc[0],g.event_time.iloc[-1]
+
+            if prev is not None:
+                seq.append({"token":self.time_token(prev,start),"visit_order":0,
+                            "visit_segment":0,"event_time":pd.NaT})
+
+            seq.append({"token":"[VS]","visit_order":0,"visit_segment":0,"event_time":pd.NaT})
+            seq.extend({"token":t,"visit_order":int(vo),"visit_segment":seg,"event_time":et}
+                       for t,et in zip(g.concept_id,g.event_time))
+            seq.extend([
+                {"token":"[VE]","visit_order":0,"visit_segment":0,"event_time":pd.NaT},
+                {"token":"[REG]","visit_order":0,"visit_segment":0,"event_time":pd.NaT}
+            ])
+            prev=end
+
+        return pd.DataFrame(seq)
+
+    def add_age(self,x,sid,ages):
+        x=x.copy()
+        x["age"]=0.
+        if sid not in ages:return x
+        age,year=ages[sid]
+        m=x.event_time.notna()
+        x.loc[m,"age"]=(age+x.loc[m,"event_time"].dt.year-year).astype(np.float32)
+        return x
+
+    def add_time(self,x):
+        x=x.copy()
+        x["time"]=0.
+        m=x.event_time.notna()
+        if not m.any():return x
+        t0=x.loc[m,"event_time"].min()
+        x.loc[m,"time"]=((x.loc[m,"event_time"]-t0).dt.total_seconds()/(86400.*7.)).astype(np.float32)
+        return x
+
+    def add_type_ids(self,x):
+        def f(t):
+            if t=="[PAD]":return 0
+            if t.startswith("LAB_"):return 1
+            if t.startswith("MEDICATION//"):return 2
+            if t.startswith("PROCEDURE//"):return 3
+            if t=="[CLS]":return 4
+            if t in ("[VS]","[VE]"):return 5
+            if t=="[REG]":return 6
+            if t.startswith("[W") or t.startswith("[M") or t=="[LT]":return 7
+            return 8
+
+        x=x.copy()
+        x["type_id"]=x.token.map(f).astype(np.int8)
+        return x
+
+    def add_token_ids(self,x,vocab):
+        x=x.copy()
+        x["token_id"]=x.token.map(vocab).fillna(vocab["[UNK]"]).astype(np.int32)
+        return x
+
+    def _make_sequence(self,g,sid,ages,bins,vocab):
+        x=self.build_sequence(self._encode_labs(g.copy(),bins))
+        x=self.add_age(x,sid,ages)
+        x=self.add_time(x)
+        x=self.add_type_ids(x)
+        return self.add_token_ids(x,vocab)
+
+    def _compact(self,x):
+        return x[["token_id","type_id","age","time","visit_order","visit_segment"]].astype({
+            "token_id":np.int32,"type_id":np.int8,"age":np.float32,"time":np.float32,
+            "visit_order":np.int32,"visit_segment":np.int8
+        })
+
+    def _chunk(self,x):
+        L=int(self.args.max_seq_len)
+        out=[]
+        start=0
+        while start<len(x):
+            end=min(start+L,len(x))
+            out.append(self._compact(x.iloc[start:end].reset_index(drop=True)))
+            if end==len(x):break
+            start=end-1
+        return out
+
+    def _truncate_finetune(self,x):
+        L=int(self.args.max_seq_len)
+        if len(x)<=L:return self._compact(x)
+        return self._compact(pd.concat([x.iloc[[0]],x.iloc[-(L-1):]],ignore_index=True))
+
+    def _empty_sequence(self,vocab):
+        x=pd.DataFrame([{"token":"[CLS]","visit_order":0,"visit_segment":0,"event_time":pd.NaT}])
+        x["age"],x["time"]=0.,0.
+        return self._compact(self.add_token_ids(self.add_type_ids(x),vocab))
+
+    def _target_rows(self):
+        c=self.dataset.cohort.copy()
+        if "dischtime" not in c.columns:
+            c=pd.read_csv(self.args.paths["cohort_path"],compression="gzip",parse_dates=["dischtime"])
+        c["dischtime"]=pd.to_datetime(c.dischtime)
+        ids=set(map(int,self.dataset.ts_id_to_ind))
+        return c[c.hadm_id.isin(ids)][["subject_id","hadm_id","dischtime"]].drop_duplicates("hadm_id")
+
+    def prepare_inputs(self):
+        if self.args.train_mode=="pretrain":
+            raise RuntimeError("Use PreprocessorEHRMambaPaperPretrain.")
+
+        vocab,bins=self.pt_meta["vocab"],self.pt_meta["lab_bin_edges"]
+        self.args.max_seq_len=int(self.pt_meta["max_seq_len"])
+        max_pretrain_visits=int(self.pt_meta["max_num_visits"])
+
+        targets=self._target_rows()
+        subjects=set(targets.subject_id.astype(int))
+        self._build_event_cache(subjects)
+
+        admissions=self._load_admissions(subjects)
+        ages=self._load_ages(subjects)
+        sequences=[None]*len(self.dataset.ts_id_to_ind)
+        max_visit=before=after=dropped=0
+
+        for b in range(self.N_BUCKETS):
+            p=self._cache/f"bucket_{b:02d}.csv.gz"
+
+            if p.exists():
+                e=pd.read_csv(p,dtype={"concept_id":"string","lab_itemid":"string"})
+                e["event_time"]=self._parse_time(e.event_time)
+                e["hadm_id"]=pd.to_numeric(e.hadm_id,errors="coerce").astype("Int64")
+                by_sid={int(s):g for s,g in e.groupby("subject_id",sort=False)}
+            else:
+                e=pd.DataFrame(columns=self.COLS)
+                by_sid={}
+
+            rows=targets[targets.subject_id.astype(np.int64)%self.N_BUCKETS==b]
+
+            for r in rows.itertuples(index=False):
+                sid,hadm=int(r.subject_id),int(r.hadm_id)
+                g=by_sid.get(sid)
+
+                if g is not None:
+                    start=r.dischtime-pd.DateOffset(days=int(self.args.days_before_discharge))
+                    g=g[(g.event_time>=start)&(g.event_time<=r.dischtime)].copy()
+
+                if g is None or g.empty:
+                    x=self._empty_sequence(vocab)
+                else:
+                    before+=int(g.hadm_id.isna().sum())
+                    g=self._attach_hadm(g,admissions)
+                    m=int(g.hadm_id.isna().sum())
+                    after+=m
+                    dropped+=m
+                    g=g[g.hadm_id.notna()].copy()
+
+                    if g.empty:
+                        x=self._empty_sequence(vocab)
+                    else:
+                        x=self._make_sequence(g,sid,ages,bins,vocab)
+                        max_visit=max(max_visit,int(x.visit_order.max()))
+                        x=self._truncate_finetune(x)
+
+                sequences[self.dataset.ts_id_to_ind[hadm]]=x
+
+            del e,by_sid
+            gc.collect()
+
+        n_missing=sum(x is None for x in sequences)
+        if n_missing:
+            empty=self._empty_sequence(vocab)
+            sequences=[empty.copy() if x is None else x for x in sequences]
+
+        if max_visit>max_pretrain_visits:
+            raise ValueError(f"Fine-tune max visits {max_visit} > pretrained {max_pretrain_visits}")
+
+        self.args.V=self.args.vocab_size=len(vocab)
+        self.args.N=len(sequences)
+        self.args.max_num_visits=max_pretrain_visits
+        self.var_to_ind=vocab
+
+        self.input_dict={
+            "ehrmamba_sequences":sequences,
+            "vocab":vocab,
+            "vocab_size":len(vocab),
+            "lab_bin_edges":bins,
+            "max_seq_len":self.args.max_seq_len,
+            "max_num_visits":max_pretrain_visits
+        }
+
+        self.args.logger.write(
+            f"\nEHRMamba-Paper FINETUNE: N={len(sequences)}, vocab={len(vocab)}, "
+            f"missing_hadm={before}->{after}, dropped={dropped}, "
+            f"missing_sequences={n_missing}, max_visits={max_visit}"
+        )
+
+
+class PreprocessorEHRMambaPaperPretrain(PreprocessorEHRMambaPaper):
+
+    def _get_subject_splits(self):
+        c=self.dataset.cohort[["subject_id","hadm_id"]].drop_duplicates()
+        out={
+            s:set(c.loc[c.hadm_id.isin(set(map(int,self.args.ids.get(s,[])))),"subject_id"].astype(int))
+            for s in ["train","val","test"]
+        }
+
+        assert out["train"].isdisjoint(out["val"])
+        assert out["train"].isdisjoint(out["test"])
+        assert out["val"].isdisjoint(out["test"])
+
+        self.args.logger.write(
+            f"\nEHRMamba pretrain subjects: train={len(out['train'])}, "
+            f"val={len(out['val'])}, test={len(out['test'])}"
+        )
+        self.args.logger.write(
+            f"\nPretrain cohort admissions={len(c)}, subjects={c.subject_id.nunique()}"
+        )
+        return out
+
+    def _seq_cache_dir(self):
+        return Path(self.args.paths["saved_data_path"])/"ehrmamba_paper_sequence_cache"/\
+               self.args.cohort/f"fold_{self.args.fold}_L{int(self.args.max_seq_len)}"
+
+    def _prepare_seq_cache(self,ss):
+        self._seq_cache=self._seq_cache_dir()
+        p=self._seq_cache/"subjects.pkl"
+        current={k:set(map(int,ss[k])) for k in ["train","val","test"]}
+
+        if self._seq_cache.exists() and p.exists() and pickle.load(open(p,"rb"))==current:
+            self.args.logger.write(f"\nUsing sequence cache: {self._seq_cache}")
+            return
+
+        if self._seq_cache.exists():shutil.rmtree(self._seq_cache)
+        self._seq_cache.mkdir(parents=True)
+        pickle.dump(current,open(p,"wb"),protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _fit_lab_bins(self,train_subjects,admissions):
+        p=self._seq_cache/"lab_bin_edges.pkl"
+        if p.exists():return pickle.load(open(p,"rb"))
+
+        tmp=self._seq_cache/"_lab_bins"
+        if tmp.exists():shutil.rmtree(tmp)
+        tmp.mkdir()
+
+        for b in range(self.N_BUCKETS):
+            q=self._cache/f"bucket_{b:02d}.csv.gz"
+            if not q.exists():continue
+
+            x=pd.read_csv(q,dtype={"concept_id":"string","lab_itemid":"string"})
+            x=x[x.subject_id.isin(train_subjects)&x.lab_itemid.notna()].copy()
+            if x.empty:continue
+
+            x["event_time"]=self._parse_time(x.event_time)
+            x["hadm_id"]=pd.to_numeric(x.hadm_id,errors="coerce").astype("Int64")
+
+            keep=[]
+            for _,g in x.groupby("subject_id",sort=False):
+                g=self._attach_hadm(g.copy(),admissions)
+                g=g[g.hadm_id.notna()]
+                if not g.empty:keep.append(g[["lab_itemid","lab_value"]])
+
+            if not keep:continue
+
+            x=pd.concat(keep,ignore_index=True)
+            x["_b"]=pd.to_numeric(x.lab_itemid,errors="coerce").fillna(0).astype(np.int64)%self.N_BUCKETS
+
+            for j,g in x.groupby("_b"):
+                f=tmp/f"{int(j):02d}.csv.gz"
+                g[["lab_itemid","lab_value"]].to_csv(
+                    f,mode="a",index=False,header=not f.exists(),
+                    compression={"method":"gzip","compresslevel":1}
+                )
+
+        edges={}
+        for q in tmp.glob("*.csv.gz"):
+            x=pd.read_csv(q,dtype={"lab_itemid":"string"})
+            for itemid,g in x.groupby("lab_itemid"):
+                edges[str(itemid)]=np.quantile(
+                    g.lab_value.to_numpy(float),[0.2,0.4,0.6,0.8]
+                ).astype(np.float32)
+
+        pickle.dump(edges,open(p,"wb"),protocol=pickle.HIGHEST_PROTOCOL)
+        shutil.rmtree(tmp)
+        self.args.logger.write(f"\nLab bin edges fitted: {len(edges)}")
+        return edges
+
+    def _build_vocab(self,train_subjects,admissions,bins):
+        tokens=set()
+
+        for b in range(self.N_BUCKETS):
+            p=self._cache/f"bucket_{b:02d}.csv.gz"
+            if not p.exists():continue
+
+            x=pd.read_csv(p,dtype={"concept_id":"string","lab_itemid":"string"})
+            x=x[x.subject_id.isin(train_subjects)].copy()
+            if x.empty:continue
+
+            x["event_time"]=self._parse_time(x.event_time)
+            x["hadm_id"]=pd.to_numeric(x.hadm_id,errors="coerce").astype("Int64")
+
+            for _,g in x.groupby("subject_id",sort=False):
+                g=self._attach_hadm(g.copy(),admissions)
+                g=g[g.hadm_id.notna()].copy()
+                if not g.empty:
+                    tokens.update(self._encode_labs(g,bins).concept_id.dropna().astype(str).unique())
+
+        vocab={t:i for i,t in enumerate(self.SPECIAL_TOKENS)}
+        for t in sorted(tokens):
+            if t not in vocab:vocab[t]=len(vocab)
+        return vocab
+
+    def _get_vocab(self,train_subjects,admissions,bins):
+        p=self._seq_cache/"vocab.pkl"
+        if p.exists():return pickle.load(open(p,"rb"))
+        vocab=self._build_vocab(train_subjects,admissions,bins)
+        pickle.dump(vocab,open(p,"wb"),protocol=pickle.HIGHEST_PROTOCOL)
+        self.args.logger.write(f"\nVocabulary built: {len(vocab)}")
+        return vocab
+
+    def _save_bucket(self,b,d):
+        p=self._seq_cache/f"bucket_{b:02d}.pkl"
+        tmp=self._seq_cache/f"bucket_{b:02d}.tmp"
+        pickle.dump(d,open(tmp,"wb"),protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(p)
+
+    def _process_bucket(self,b,ss,ages,admissions,bins,vocab):
+        out=self._seq_cache/f"bucket_{b:02d}.pkl"
+        if out.exists():
+            self.args.logger.write(f"\nBucket {b+1}/{self.N_BUCKETS}: cached")
+            return
+
+        p=self._cache/f"bucket_{b:02d}.csv.gz"
+        if not p.exists():return
+
+        e=pd.read_csv(p,dtype={"concept_id":"string","lab_itemid":"string"})
+        e["event_time"]=self._parse_time(e.event_time)
+        e["hadm_id"]=pd.to_numeric(e.hadm_id,errors="coerce").astype("Int64")
+        e=e.sort_values(["subject_id","event_time","hadm_id"],kind="stable")
+
+        seqs,sids,codes=[],[],[]
+        total=before=after=dropped=max_visit=0
+
+        for sid,g in e.groupby("subject_id",sort=False):
+            sid=int(sid)
+
+            if sid in ss["train"]:code=0
+            elif sid in ss["val"]:code=1
+            elif sid in ss["test"]:code=2
+            else:continue
+
+            g=g.copy()
+            total+=len(g)
+            before+=int(g.hadm_id.isna().sum())
+            g=self._attach_hadm(g,admissions)
+
+            m=int(g.hadm_id.isna().sum())
+            after+=m
+            dropped+=m
+            g=g[g.hadm_id.notna()].copy()
+
+            if g.empty:continue
+
+            x=self._make_sequence(g,sid,ages,bins,vocab)
+            max_visit=max(max_visit,int(x.visit_order.max()))
+
+            for c in self._chunk(x):
+                seqs.append(c)
+                sids.append(sid)
+                codes.append(code)
+
+        self._save_bucket(b,{
+            "sequences":seqs,
+            "subject_ids":sids,
+            "split":np.asarray(codes,dtype=np.int8),
+            "max_visit":max_visit,
+            "total_events":total,
+            "missing_before":before,
+            "missing_after":after,
+            "dropped":dropped
+        })
+
+        self.args.logger.write(
+            f"\nBucket {b+1}/{self.N_BUCKETS}: saved, chunks={len(seqs)}, events={total}, "
+            f"missing_hadm={before}->{after}, dropped={dropped}, max_visits={max_visit}"
+        )
+
+    def prepare_inputs(self):
+        ss=self._get_subject_splits()
+        subjects=set().union(*ss.values())
+
+        assert len(ss["train"])>0
+        assert len(ss["val"])>0
+        assert ss["train"].isdisjoint(ss["val"])
+
+        self._build_event_cache(subjects)
+        self._prepare_seq_cache(ss)
+
+        admissions=self._load_admissions(subjects)
+        ages=self._load_ages(subjects)
+        bins=self._fit_lab_bins(ss["train"],admissions)
+        vocab=self._get_vocab(ss["train"],admissions,bins)
+
+        for b in range(self.N_BUCKETS):
+            self._process_bucket(b,ss,ages,admissions,bins,vocab)
+
+        sequences,subject_ids=[],[]
+        splits={"train":[],"val":[],"test":[]}
+        total=before=after=dropped=max_visit=0
+
+        for b in range(self.N_BUCKETS):
+            p=self._seq_cache/f"bucket_{b:02d}.pkl"
+            if not p.exists():continue
+
+            d=pickle.load(open(p,"rb"))
+            off=len(sequences)
+            sequences.extend(d["sequences"])
+            subject_ids.extend(d["subject_ids"])
+
+            max_visit=max(max_visit,d["max_visit"])
+            total+=d["total_events"]
+            before+=d["missing_before"]
+            after+=d["missing_after"]
+            dropped+=d["dropped"]
+
+            for code,name in enumerate(["train","val","test"]):
+                splits[name].extend((np.where(d["split"]==code)[0]+off).tolist())
+
+        splits={k:np.asarray(v,dtype=np.int64) for k,v in splits.items()}
+        lengths=np.asarray([len(x) for x in sequences],dtype=np.int32)
+
+        assert len(sequences)>0
+        assert len(splits["train"])>0
+        assert len(splits["val"])>0
+        assert lengths.max()<=int(self.args.max_seq_len)
+        assert len(vocab)>len(self.SPECIAL_TOKENS)
+
+        self.args.V=self.args.vocab_size=len(vocab)
+        self.args.N=len(sequences)
+        self.args.max_num_visits=max(int(getattr(self.args,"max_num_visits",1024)),max_visit)
+        self.var_to_ind=vocab
+
+        self.input_dict={
+            "ehrmamba_sequences":sequences,
+            "subject_ids":np.asarray(subject_ids,dtype=np.int64),
+            "vocab":vocab,
+            "vocab_size":len(vocab),
+            "lab_bin_edges":bins,
+            "max_seq_len":int(self.args.max_seq_len),
+            "max_num_visits":self.args.max_num_visits,
+            "splits":splits,
+            "var_to_ind":vocab
+        }
+
+        pct=100.*dropped/total if total else 0.
+
+        self.args.logger.write(
+            f"\nEHRMamba-Paper PRETRAIN: patients={len(set(subject_ids))}, chunks={len(sequences)}, "
+            f"train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}, "
+            f"vocab={len(vocab)}, median_len={int(np.median(lengths))}, max_len={int(lengths.max())}, "
+            f"max_visits={max_visit}, events={total}, missing_hadm={before}->{after}, "
+            f"dropped={dropped} ({pct:.2f}%)"
+        )
+
+    def save_inputs(self):
+        meta={k:self.input_dict[k] for k in [
+            "vocab","vocab_size","lab_bin_edges","max_seq_len","max_num_visits"
+        ]}
+        pickle.dump(
+            meta,
+            open(Path(self.args.paths["output_path"])/"pt_saved_variables.pkl","wb"),
+            protocol=pickle.HIGHEST_PROTOCOL
+        )

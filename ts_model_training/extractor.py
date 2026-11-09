@@ -61,6 +61,9 @@ class ExtractorTrain(Extractor):
         super().__init__(args)
         
     def extract_mimic_labs(self):
+        if self.cohort=="mimic_cohort_cancer_sepsis_icu24h":
+            return self.extract_mimic_icu24h_labs()
+
         admission_labs = pd.read_csv(
             self.features_path,
             compression="gzip",
@@ -84,7 +87,45 @@ class ExtractorTrain(Extractor):
             self.data_path, index=False, compression="gzip"
         )
         self.args.logger.write(f"Labs processed and saved to {self.data_path}")
-        
+    def extract_mimic_icu24h_labs(self):
+        c=pd.read_csv(self.cohort_path,compression="gzip",
+            usecols=["subject_id","hadm_id","source_hadm_id","intime"],
+            parse_dates=["intime"])
+        ref=c[["subject_id","source_hadm_id","hadm_id","intime"]]
+        hadms=set(c.source_hadm_id)
+        raw=Path(MIMIC_DIR)/"hosp/labevents.csv.gz"
+
+        if self.data_path.exists(): self.data_path.unlink()
+        first=True;n=0
+
+        for x in pd.read_csv(raw,
+            usecols=["subject_id","hadm_id","itemid","charttime","valuenum"],
+            chunksize=1_000_000):
+
+            x=x[x.hadm_id.isin(hadms)&x.valuenum.notna()&x.charttime.notna()&
+                ~x.itemid.isin(self.itemids_to_remove)].copy()
+            if x.empty: continue
+
+            x["charttime"]=pd.to_datetime(x.charttime,format="mixed")
+            x=x.rename(columns={"hadm_id":"source_hadm_id"})
+            x=x.merge(ref,on=["subject_id","source_hadm_id"])
+
+            x["minute"]=(x.charttime-x.intime).dt.total_seconds()/60
+            x=x[(x.minute>=0)&(x.minute<1440)].copy()
+            if x.empty: continue
+
+            x["minute"]=x.minute.astype(int)
+            x["hour"]=(x.minute//60).astype(int)
+            x["day"]=0
+            x=x.rename(columns={"valuenum":"value"})
+
+            y=x[["subject_id","hadm_id","itemid","value","minute","hour","day"]]
+            y.to_csv(self.data_path,mode="a",header=first,index=False,compression="gzip")
+            first=False;n+=len(y)
+
+        if first: raise RuntimeError("No first-24h ICU labs found.")
+        self.args.logger.write(f"ICU first-24h labs: {n} events saved to {self.data_path}")
+
     def extract_uker_labs(self):
         admission_labs = pd.read_csv(
             self.features_path,
@@ -275,9 +316,10 @@ class ExtractorPretrain(Extractor):
         # get cohort ids
         cohort_subj_ids = np.concatenate([
             pd.read_csv(self.saved_data_path / 'cohorts' / 'mimic_cohort_NF_30_days.csv.gz', compression='gzip')["subject_id"].values,
-            pd.read_csv(self.saved_data_path / 'cohorts' / 'mimic_cohort_aplasia_45_days.csv.gz', compression='gzip')["subject_id"].values
+            pd.read_csv(self.saved_data_path / 'cohorts' / 'mimic_cohort_aplasia_45_days.csv.gz', compression='gzip')["subject_id"].values,
+            pd.read_csv(self.saved_data_path / 'cohorts' / 'mimic_cohort_cancer_sepsis_icu24h.csv.gz', compression='gzip')["subject_id"].values
         ])
-
+        cohort_subj_ids = np.unique(cohort_subj_ids)
         # remove ids in training cohorts
         pt_ids = pt_ids[~pt_ids["subject_id"].isin(cohort_subj_ids)].reset_index(drop=True)
         pt_ids.to_csv(self.CV_folds_dir / "pt_ids.csv")

@@ -9,7 +9,8 @@ from ts_model_training.ts_models.mlp import MLP
 from ts_model_training.ts_models.ts_mamba import MAMBA_TS
 from ts_model_training.ts_models.ts_mamba_fusion import MAMBA_FUSION_TS
 from ts_model_training.ts_models.ts_ehrmamba_lab import EHRMAMBA_LAB_TS
-from ts_model_training.batcher import Batcher, BatcherA, BatcherB, BatcherC_sup, BatcherC_unsup, BatcherEHRMamba, BatcherEHRMambaPretrain, BatcherEHRMambaStratsPretrain
+from ts_model_training.ts_models.ts_ehrmamba import EHRMAMBA_PAPER_TS
+from ts_model_training.batcher import Batcher, BatcherA, BatcherB, BatcherC_sup, BatcherC_unsup, BatcherEHRMamba, BatcherEHRMambaPretrain, BatcherEHRMambaStratsPretrain, BatcherEHRMambaPaper, BatcherEHRMambaPaperPretrain
 
 MODEL_CLASSES = {
     'gru': GRU_TS,
@@ -23,6 +24,7 @@ MODEL_CLASSES = {
     "mamba": MAMBA_TS,
     "mamba_fusion": MAMBA_FUSION_TS,
     'ehrmamba_lab': EHRMAMBA_LAB_TS,
+    'ehrmamba_paper': EHRMAMBA_PAPER_TS,
 }
 
 def build_model(args):
@@ -47,6 +49,10 @@ def build_batcher(args, input_dict):
             batcher = BatcherEHRMambaPretrain(args, input_dict)
     elif model_type == 'ehrmamba_lab':
         batcher = BatcherEHRMamba(args, input_dict)
+    elif model_type == "ehrmamba_paper" and args.train_mode == "pretrain":
+        batcher = BatcherEHRMambaPaperPretrain(args, input_dict)
+    elif model_type == "ehrmamba_paper":
+        batcher = BatcherEHRMambaPaper(args, input_dict)
     elif model_type in ['grud', 'interpnet']:
         batcher = BatcherB(args, input_dict)
     elif model_type in ['strats', 'istrats'] and args.train_mode == "pretrain":
@@ -58,3 +64,4 @@ def build_batcher(args, input_dict):
 
     args.logger.write('\nBatching module assigned.')
     return batcher
+

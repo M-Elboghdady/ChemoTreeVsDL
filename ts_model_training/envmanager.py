@@ -127,7 +127,7 @@ class EnvManager:
 
     def resolve_mode(self):
         # determine training mode and load checkpoint if provided.
-        pretrainable_models = ("strats", "ehrmamba_lab")
+        pretrainable_models = ("strats", "ehrmamba_lab", "ehrmamba_paper")
         if self.args.model_type in pretrainable_models and self.args.load_ckpt_path is not None:
             self.args.pt_var_path = Path(self.args.load_ckpt_path) / 'pt_saved_variables.pkl'
             self.args.pt_dict_path = Path(self.args.load_ckpt_path) / 'checkpoint_best.bin'

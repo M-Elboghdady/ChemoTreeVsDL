@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import pandas as pd
 #from ts_model_training.primenet.collator import CLDataCollator ##new primenet
 from ts_model_training.cycler import CycleIndex, CycleIndexBalanced
 
@@ -420,4 +421,102 @@ class BatcherEHRMambaStratsPretrain(BatcherC_unsup): # Head-to-Head with strats
             "demo": batch["demo"],
             "forecast_values": batch["forecast_values"],
             "forecast_mask": batch["forecast_mask"].float(),
+        }
+
+
+class BatcherEHRMambaPaper(Batcher):
+    def __init__(self, args, input_dict):
+        super().__init__(args, input_dict)
+        self.sequences = input_dict["ehrmamba_sequences"]
+        self.max_seq_len = int(input_dict["max_seq_len"])
+
+    def _pad(self, seq):
+        L = self.max_seq_len
+        seq = seq.iloc[:L].reset_index(drop=True)
+        n = len(seq)
+
+        def a(c, dt):
+            x = seq[c].to_numpy(dtype=dt)
+            return np.pad(x, (0, L-len(x)))
+
+        return {
+            "token_ids":a("token_id",np.int64),
+            "type_ids":a("type_id",np.int64),
+            "ages":a("age",np.float32),
+            "times":a("time",np.float32),
+            "visit_orders":a("visit_order",np.int64),
+            "visit_segments":a("visit_segment",np.int64),
+            "attention_mask":np.r_[np.ones(n),np.zeros(L-n)].astype(np.float32),
+            "length":n
+        }
+
+    def get_batch(self, ind=None):
+        ind = self._get_indices(ind)
+        r = [self._pad(self.sequences[i]) for i in ind]
+
+        return {
+            "token_ids":torch.LongTensor(np.stack([x["token_ids"] for x in r])),
+            "type_ids":torch.LongTensor(np.stack([x["type_ids"] for x in r])),
+            "ages":torch.FloatTensor(np.stack([x["ages"] for x in r])),
+            "times":torch.FloatTensor(np.stack([x["times"] for x in r])),
+            "visit_orders":torch.LongTensor(np.stack([x["visit_orders"] for x in r])),
+            "visit_segments":torch.LongTensor(np.stack([x["visit_segments"] for x in r])),
+            "attention_mask":torch.FloatTensor(np.stack([x["attention_mask"] for x in r])),
+            "lengths":torch.LongTensor([x["length"] for x in r]),
+            "demo":torch.FloatTensor(self.demo[ind]),
+            "labels":torch.FloatTensor(self.y[ind])
+        }
+
+
+class BatcherEHRMambaPaperPretrain:
+    def __init__(self, args, input_dict):
+        self.args = args
+        self.sequences = input_dict["ehrmamba_sequences"]
+        self.splits = input_dict["splits"]
+        self.max_seq_len = int(input_dict["max_seq_len"])
+
+    def _get_indices(self, ind=None):
+        if ind is not None: return np.asarray(ind,dtype=int)
+        tr = np.asarray(self.splits["train"],dtype=int)
+        n = min(int(self.args.train_batch_size),len(tr))
+        return np.random.choice(tr,n,replace=False)
+
+    def _pad(self, seq):
+        L = self.max_seq_len
+        seq = seq.iloc[:L].reset_index(drop=True)
+        n = len(seq)
+
+        def a(c, dt):
+            x = seq[c].to_numpy(dtype=dt)
+            return np.pad(x,(0,L-len(x)))
+
+        ids = a("token_id",np.int64)
+        labels = np.full(L,-100,dtype=np.int64)
+        labels[:max(0,n-1)] = ids[1:n]
+
+        return {
+            "token_ids":ids,
+            "type_ids":a("type_id",np.int64),
+            "ages":a("age",np.float32),
+            "times":a("time",np.float32),
+            "visit_orders":a("visit_order",np.int64),
+            "visit_segments":a("visit_segment",np.int64),
+            "attention_mask":np.r_[np.ones(n),np.zeros(L-n)].astype(np.float32),
+            "labels":labels,
+            "forecast_mask":(labels != -100).astype(np.float32)
+        }
+
+    def get_batch(self, ind=None):
+        r = [self._pad(self.sequences[i]) for i in self._get_indices(ind)]
+
+        return {
+            "token_ids":torch.LongTensor(np.stack([x["token_ids"] for x in r])),
+            "type_ids":torch.LongTensor(np.stack([x["type_ids"] for x in r])),
+            "ages":torch.FloatTensor(np.stack([x["ages"] for x in r])),
+            "times":torch.FloatTensor(np.stack([x["times"] for x in r])),
+            "visit_orders":torch.LongTensor(np.stack([x["visit_orders"] for x in r])),
+            "visit_segments":torch.LongTensor(np.stack([x["visit_segments"] for x in r])),
+            "attention_mask":torch.FloatTensor(np.stack([x["attention_mask"] for x in r])),
+            "labels":torch.LongTensor(np.stack([x["labels"] for x in r])),
+            "forecast_mask":torch.FloatTensor(np.stack([x["forecast_mask"] for x in r]))
         }
